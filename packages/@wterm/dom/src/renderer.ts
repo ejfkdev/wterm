@@ -9,6 +9,8 @@ const FLAG_REVERSE = 0x20;
 const FLAG_INVISIBLE = 0x40;
 const FLAG_STRIKETHROUGH = 0x80;
 
+const FLAG_CONTINUATION = 0x02;
+
 function colorToCSS(index: number): string | null {
   if (index === DEFAULT_COLOR) return null;
   if (index < 16) return `var(--term-color-${index})`;
@@ -201,6 +203,7 @@ export class Renderer {
       fg: number;
       bg: number;
       flags: number;
+      wide: number;
     },
     lineLen: number,
     cursorCol: number,
@@ -208,15 +211,24 @@ export class Renderer {
   ): void {
     rowEl.textContent = "";
 
+    // If cursor is on a continuation cell, snap it back to the wide character
+    let effectiveCursorCol = cursorCol;
+    if (cursorCol >= 1) {
+      const cc = getCell(cursorCol);
+      if (cc.wide & FLAG_CONTINUATION) effectiveCursorCol = cursorCol - 1;
+    }
+
     let runStyle = "";
     let runText = "";
-    let runStart = 0;
+    let runLogicalStart = 0;
+    let logicalCol = 0;
+    let cursorLogicalCol = -1;
 
-    const flushRun = (endCol: number) => {
+    const flushRun = (endLogical: number) => {
       if (!runText) return;
 
-      if (cursorCol >= runStart && cursorCol < endCol) {
-        const offset = cursorCol - runStart;
+      if (cursorLogicalCol >= runLogicalStart && cursorLogicalCol < endLogical) {
+        const offset = cursorLogicalCol - runLogicalStart;
         const before = runText.slice(0, offset);
         const cursorChar = runText[offset];
         const after = runText.slice(offset + 1);
@@ -238,22 +250,34 @@ export class Renderer {
     for (let col = 0; col < this.cols; col++) {
       const cell = getCell(col);
       const inBounds = col < lineLen;
+
+      // Track cursor logical position
+      if (col === effectiveCursorCol && cursorLogicalCol < 0) {
+        cursorLogicalCol = logicalCol;
+      }
+
+      // Skip continuation cells — they are rendered as part of the wide char
+      if (inBounds && (cell.wide & FLAG_CONTINUATION)) {
+        continue;
+      }
+
       const cp = inBounds ? cell.char : 0;
 
       if (inBounds && cp >= 0x2580 && cp <= 0x259f) {
-        flushRun(col);
+        flushRun(logicalCol);
 
         const colors = resolveColors(cell.fg, cell.bg, cell.flags);
         const span = document.createElement("span");
         span.className =
-          col === cursorCol ? "term-block term-cursor" : "term-block";
+          col === effectiveCursorCol ? "term-block term-cursor" : "term-block";
         span.style.background = getBlockBackground(cp, colors.fg, colors.bg);
         if (cell.flags & FLAG_DIM) span.style.opacity = "0.5";
         rowEl.appendChild(span);
 
         runStyle = "";
         runText = "";
-        runStart = col + 1;
+        runLogicalStart = logicalCol + 1;
+        logicalCol++;
       } else {
         const ch = inBounds && cp >= 32 ? String.fromCodePoint(cp) : " ";
         const style = inBounds
@@ -261,16 +285,23 @@ export class Renderer {
           : "";
 
         if (style !== runStyle) {
-          flushRun(col);
+          flushRun(logicalCol);
           runStyle = style;
           runText = ch;
-          runStart = col;
+          runLogicalStart = logicalCol;
         } else {
           runText += ch;
         }
+        logicalCol++;
       }
     }
-    flushRun(this.cols);
+
+    // Handle cursor at the end of line
+    if (cursorCol >= this.cols - 1 && cursorLogicalCol < 0) {
+      cursorLogicalCol = logicalCol;
+    }
+
+    flushRun(logicalCol);
 
     // Extend the row background when the line fills the full width.
     // When lineLen < cols, bgCss stays "" which clears any stale bg

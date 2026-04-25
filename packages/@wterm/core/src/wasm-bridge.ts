@@ -3,6 +3,7 @@ export interface CellData {
   fg: number;
   bg: number;
   flags: number;
+  wide: number;
 }
 
 export interface CursorState {
@@ -133,6 +134,7 @@ export class WasmBridge {
       fg: dv.getUint16(offset + 4, true),
       bg: dv.getUint16(offset + 6, true),
       flags: dv.getUint8(offset + 8),
+      wide: dv.getUint8(offset + 9),
     };
   }
 
@@ -200,6 +202,7 @@ export class WasmBridge {
       fg: dv.getUint16(off + 4, true),
       bg: dv.getUint16(off + 6, true),
       flags: dv.getUint8(off + 8),
+      wide: dv.getUint8(off + 9),
     };
   }
 

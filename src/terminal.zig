@@ -251,17 +251,45 @@ pub const Terminal = struct {
             self.wrap_pending = false;
         }
 
+        const wide = isWide(codepoint);
+
+        // If a wide character doesn't fit at the end of the line, pad and wrap
+        if (wide and self.cursor_col + 1 >= self.cols) {
+            self.grid.setCell(self.cursor_row, self.cursor_col, self.blankCell());
+            self.cursor_col = 0;
+            self.doLinefeed();
+        }
+
         self.grid.setCell(self.cursor_row, self.cursor_col, Cell{
             .char = @intCast(codepoint),
             .fg = self.current_fg,
             .bg = self.current_bg,
             .flags = self.current_flags,
+            .wide = if (wide) cell_mod.FLAG_WIDE else 0,
         });
 
-        if (self.cursor_col < self.cols - 1) {
-            self.cursor_col += 1;
-        } else if (self.auto_wrap) {
-            self.wrap_pending = true;
+        if (wide and self.cursor_col + 1 < self.cols) {
+            self.grid.setCell(self.cursor_row, self.cursor_col + 1, Cell{
+                .char = 0,
+                .fg = self.current_fg,
+                .bg = self.current_bg,
+                .flags = self.current_flags,
+                .wide = cell_mod.FLAG_CONTINUATION,
+            });
+        }
+
+        if (wide) {
+            self.cursor_col += 2;
+            if (self.cursor_col >= self.cols) {
+                self.cursor_col = self.cols - 1;
+                if (self.auto_wrap) self.wrap_pending = true;
+            }
+        } else {
+            if (self.cursor_col < self.cols - 1) {
+                self.cursor_col += 1;
+            } else if (self.auto_wrap) {
+                self.wrap_pending = true;
+            }
         }
     }
 
@@ -284,6 +312,13 @@ pub const Terminal = struct {
     fn backspace(self: *Terminal) void {
         if (self.cursor_col > 0) {
             self.cursor_col -= 1;
+            // Skip over continuation cell of a wide character
+            if (self.cursor_col > 0) {
+                const cell = self.grid.getCell(self.cursor_row, self.cursor_col);
+                if (cell.wide & cell_mod.FLAG_CONTINUATION != 0) {
+                    self.cursor_col -= 1;
+                }
+            }
             self.wrap_pending = false;
         }
     }
@@ -570,12 +605,26 @@ pub const Terminal = struct {
         const amount = if (n == 0) 1 else n;
         const max = self.cols - 1;
         self.cursor_col = if (self.cursor_col + amount > max) max else self.cursor_col + amount;
+        // Skip over continuation cell of a wide character
+        if (self.cursor_col < max) {
+            const cell = self.grid.getCell(self.cursor_row, self.cursor_col);
+            if (cell.wide & cell_mod.FLAG_CONTINUATION != 0) {
+                self.cursor_col = if (self.cursor_col + 1 > max) max else self.cursor_col + 1;
+            }
+        }
         self.wrap_pending = false;
     }
 
     fn cursorBackward(self: *Terminal, n: u16) void {
         const amount = if (n == 0) 1 else n;
         self.cursor_col = if (amount > self.cursor_col) 0 else self.cursor_col - amount;
+        // Skip over continuation cell of a wide character
+        if (self.cursor_col > 0) {
+            const cell = self.grid.getCell(self.cursor_row, self.cursor_col);
+            if (cell.wide & cell_mod.FLAG_CONTINUATION != 0) {
+                self.cursor_col -= 1;
+            }
+        }
         self.wrap_pending = false;
     }
 
@@ -862,6 +911,32 @@ pub const Terminal = struct {
     }
 };
 
+/// Returns true if the codepoint is a wide (double-width) character
+/// according to Unicode East_Asian_Width property.
+fn isWide(cp: u21) bool {
+    return switch (cp) {
+        0x1100...0x115F => true, // Hangul Jamo
+        0x2329, 0x232A => true, // Angle brackets
+        0x2E80...0x303E => true, // CJK Radicals / Symbols / Punctuation
+        0x3041...0x3247 => true, // Hiragana / Katakana / Bopomofo
+        0x3250...0x4DBF => true, // CJK Compatibility / Extension A
+        0x4E00...0x9FFF => true, // CJK Unified Ideographs
+        0xA000...0xA4C6 => true, // Yi Syllables / Radicals
+        0xA960...0xA97C => true, // Hangul Jamo Extended-B
+        0xAC00...0xD7A3 => true, // Hangul Syllables
+        0xF900...0xFAFF => true, // CJK Compatibility Ideographs
+        0xFE10...0xFE6B => true, // CJK Forms / Small Variants
+        0xFF01...0xFF60 => true, // Fullwidth Forms
+        0xFFE0...0xFFE6 => true, // Fullwidth Signs
+        0x1F200...0x1F251 => true,
+        0x1F300...0x1F64F => true, // Misc Symbols / Emoji
+        0x1F680...0x1F6FF => true,
+        0x1F900...0x1F9FF => true,
+        0x20000...0x3FFFD => true, // CJK Extension B+
+        else => false,
+    };
+}
+
 fn appendU16(buf: []u8, start: u8, val: u16) u8 {
     var v = val;
     var tmp: [5]u8 = undefined;
@@ -1018,4 +1093,48 @@ test "scrollback" {
     const line0 = sb.getLine(0).?;
     try testing.expectEqual(@as(u32, 'L'), line0.cells[0].char);
     try testing.expectEqual(@as(u32, '2'), line0.cells[1].char);
+}
+
+test "wide character print" {
+    const testing = @import("std").testing;
+    var t = Terminal.init(80, 24);
+    // U+4E2D = 中 (CJK Unified Ideograph)
+    t.write("中");
+    const c0 = t.grid.getCell(0, 0);
+    try testing.expectEqual(@as(u32, 0x4E2D), c0.char);
+    try testing.expectEqual(cell_mod.FLAG_WIDE, c0.wide);
+    const c1 = t.grid.getCell(0, 1);
+    try testing.expectEqual(@as(u32, 0), c1.char);
+    try testing.expectEqual(cell_mod.FLAG_CONTINUATION, c1.wide);
+    try testing.expectEqual(@as(u16, 2), t.cursor_col);
+}
+
+test "wide character followed by narrow" {
+    const testing = @import("std").testing;
+    var t = Terminal.init(80, 24);
+    t.write("中A");
+    try testing.expectEqual(@as(u32, 0x4E2D), t.grid.getCell(0, 0).char);
+    try testing.expectEqual(cell_mod.FLAG_WIDE, t.grid.getCell(0, 0).wide);
+    try testing.expectEqual(cell_mod.FLAG_CONTINUATION, t.grid.getCell(0, 1).wide);
+    try testing.expectEqual(@as(u32, 'A'), t.grid.getCell(0, 2).char);
+    try testing.expectEqual(@as(u16, 3), t.cursor_col);
+}
+
+test "backspace skips continuation cell" {
+    const testing = @import("std").testing;
+    var t = Terminal.init(80, 24);
+    t.write("中\x08");
+    try testing.expectEqual(@as(u16, 0), t.cursor_col);
+}
+
+test "wide character at end of line wraps" {
+    const testing = @import("std").testing;
+    var t = Terminal.init(5, 3);
+    // Fill first 4 columns, then write a wide char at column 4
+    t.write("1234中");
+    // "1234" fills cols 0-3, "中" doesn't fit → pad col 4 with blank, wrap to next line
+    try testing.expectEqual(@as(u32, '4'), t.grid.getCell(0, 3).char);
+    try testing.expectEqual(@as(u32, 0x4E2D), t.grid.getCell(1, 0).char);
+    try testing.expectEqual(cell_mod.FLAG_WIDE, t.grid.getCell(1, 0).wide);
+    try testing.expectEqual(cell_mod.FLAG_CONTINUATION, t.grid.getCell(1, 1).wide);
 }

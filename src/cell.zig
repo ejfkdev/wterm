@@ -9,13 +9,17 @@ pub const FLAG_REVERSE: u8 = 0x20;
 pub const FLAG_INVISIBLE: u8 = 0x40;
 pub const FLAG_STRIKETHROUGH: u8 = 0x80;
 
+/// Wide-character flags stored in Cell.wide (offset+9).
+pub const FLAG_WIDE: u8 = 0x01;
+pub const FLAG_CONTINUATION: u8 = 0x02;
+
 /// 12-byte extern struct with C-compatible layout so JS can read directly from WASM memory.
 pub const Cell = extern struct {
     char: u32 = ' ',
     fg: u16 = DEFAULT_COLOR,
     bg: u16 = DEFAULT_COLOR,
     flags: u8 = 0,
-    _pad1: u8 = 0,
+    wide: u8 = 0,
     _pad2: u8 = 0,
     _pad3: u8 = 0,
 
