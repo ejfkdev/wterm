@@ -195,6 +195,12 @@ pub const Terminal = struct {
         self.grid.cols = cols;
         self.grid.rows = rows;
 
+        // Keep alt_grid dimensions in sync with current terminal size
+        if (self.alt_grid) |ag| {
+            ag.cols = cols;
+            ag.rows = rows;
+        }
+
         // Clear any newly exposed rows when growing vertically
         if (rows > old_rows) {
             var r: u16 = old_rows;
@@ -519,14 +525,28 @@ pub const Terminal = struct {
 
         if (alt) {
             if (save_cursor) self.saveCursorToAlt();
-            ag.* = self.grid;
+            // Copy only active rows (not the entire 256x256 fixed array)
+            ag.cols = self.grid.cols;
+            ag.rows = self.grid.rows;
+            var r: u16 = 0;
+            while (r < self.grid.rows) : (r += 1) {
+                ag.cells[r] = self.grid.cells[r];
+                ag.dirty[r] = self.grid.dirty[r];
+            }
             self.grid.reset(self.cols, self.rows);
             self.using_alt_screen = true;
         } else {
-            self.grid = ag.*;
+            // Copy only active rows back
+            var r: u16 = 0;
+            while (r < ag.rows) : (r += 1) {
+                self.grid.cells[r] = ag.cells[r];
+                self.grid.dirty[r] = 1;
+            }
+            self.grid.cols = self.cols;
+            self.grid.rows = self.rows;
             self.using_alt_screen = false;
             if (save_cursor) self.restoreCursorFromAlt();
-            var r: u16 = 0;
+            r = 0;
             while (r < self.rows) : (r += 1) {
                 self.grid.dirty[r] = 1;
             }

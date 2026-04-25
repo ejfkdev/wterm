@@ -16,6 +16,7 @@ var initialized: bool = false;
 export fn init(cols: u32, rows: u32) void {
     const c: u16 = if (cols > grid_mod.MAX_COLS) grid_mod.MAX_COLS else if (cols == 0) 1 else @intCast(cols);
     const r: u16 = if (rows > grid_mod.MAX_ROWS) grid_mod.MAX_ROWS else if (rows == 0) 1 else @intCast(rows);
+    alt_grid.reset(c, r);
     terminal.reset(c, r);
     terminal.scrollback = &scrollback;
     terminal.alt_grid = &alt_grid;
