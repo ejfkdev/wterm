@@ -1,4 +1,4 @@
-import type { WasmBridge } from "../core/index.js";
+import type { WasmBridge } from "@wterm/core";
 
 const NORMAL_KEYS: Record<string, string> = {
   ArrowUp: "\x1b[A",
@@ -141,15 +141,27 @@ export class InputHandler {
     this.textarea.remove();
   }
 
-  /** Move the textarea to the cursor's pixel position so the IME candidate
+  /** Position the textarea at the rendered cursor element so the IME candidate
    *  window appears at the cursor, and the browser won't scroll the terminal
-   *  to bring an off-screen textarea into view. Called after each render. */
-  positionAtCursor(row: number, col: number, rowHeight: number, charWidth: number): void {
-    const cs = getComputedStyle(this.element);
-    const pl = parseFloat(cs.paddingLeft) || 0;
-    const pt = parseFloat(cs.paddingTop) || 0;
-    this.textarea.style.left = `${pl + col * charWidth}px`;
-    this.textarea.style.top = `${pt + row * rowHeight}px`;
+   *  to bring an off-screen textarea into view. Uses the actual DOM position
+   *  which automatically accounts for scrollback rows, padding, etc.
+   *  On mobile, the textarea is clamped to the visible area so the browser
+   *  doesn't scroll to show a textarea that's behind the virtual keyboard. */
+  positionAtCursor(): void {
+    const cursorEl = this.element.querySelector(".term-cursor");
+    if (!cursorEl) return;
+    const termRect = this.element.getBoundingClientRect();
+    const cursorRect = cursorEl.getBoundingClientRect();
+    const left = cursorRect.left - termRect.left + this.element.scrollLeft;
+    let top = cursorRect.top - termRect.top + this.element.scrollTop;
+    // Clamp to visible area to prevent mobile browsers from scrolling the
+    // terminal when the cursor is below the viewport (behind the keyboard).
+    const maxTop = this.element.scrollTop + this.element.clientHeight - 1;
+    const minTop = this.element.scrollTop;
+    if (top > maxTop) top = maxTop;
+    if (top < minTop) top = minTop;
+    this.textarea.style.left = `${left}px`;
+    this.textarea.style.top = `${top}px`;
   }
 
   private handleKeyDown(e: KeyboardEvent): void {

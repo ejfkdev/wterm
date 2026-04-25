@@ -1,4 +1,4 @@
-import { WasmBridge } from "../core/index.js";
+import { WasmBridge } from "@wterm/core";
 import { Renderer } from "./renderer.js";
 import { InputHandler } from "./input.js";
 import { DebugAdapter } from "./debug.js";
@@ -60,7 +60,15 @@ export class WTerm {
 
     this._onClickFocus = () => {
       const sel = window.getSelection();
-      if (!sel || sel.isCollapsed) this.input?.focus();
+      if (!sel || sel.isCollapsed) {
+        // Save scroll position before focus — mobile browsers may scroll the
+        // terminal to show the focused textarea even with preventScroll:true.
+        const saved = this.element.scrollTop;
+        this.input?.focus();
+        if (this.element.scrollTop !== saved) {
+          this.element.scrollTop = saved;
+        }
+      }
     };
     this.element.addEventListener("click", this._onClickFocus);
   }
@@ -143,12 +151,26 @@ export class WTerm {
 
   resize(cols: number, rows: number): void {
     if (!this.bridge) return;
-    this._shouldScrollToBottom = this._isScrolledToBottom();
+    // Only upgrade _shouldScrollToBottom — never downgrade.
+    // When multiple resize events fire before the render (e.g. mobile keyboard
+    // animation), setup() clears innerHTML which resets scrollTop to 0, causing
+    // subsequent _isScrolledToBottom() checks to return false. By only upgrading,
+    // we preserve the original scroll-to-bottom intent.
+    if (this._isScrolledToBottom()) {
+      this._shouldScrollToBottom = true;
+    }
     this.cols = cols;
     this.rows = rows;
     this.bridge.resize(cols, rows);
     this.renderer?.setup(cols, rows);
-    this._scheduleRender();
+    // Render immediately instead of scheduling. setup() clears innerHTML which
+    // resets scrollTop to 0; rendering now avoids a visible flash of scrolled-
+    // to-top content between the clear and the next animation frame.
+    if (this.rafId != null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+    this._doRender();
     if (this.onResize) this.onResize(cols, rows);
   }
 
@@ -200,14 +222,7 @@ export class WTerm {
     // Position the hidden textarea at the cursor so the IME candidate window
     // appears at the cursor and the browser doesn't scroll the terminal.
     if (this.input) {
-      const cursor = this.bridge.getCursor();
-      const charWidth = this._measureCharSize()?.charWidth
-        || parseFloat(getComputedStyle(this.element).fontSize) * 0.6;
-      this.input.positionAtCursor(
-        cursor.row, cursor.col,
-        this._rowHeight || 17,
-        charWidth,
-      );
+      this.input.positionAtCursor();
     }
 
     const title = this.bridge.getTitle();
