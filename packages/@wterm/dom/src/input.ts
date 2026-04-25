@@ -1,4 +1,4 @@
-import type { WasmBridge } from "@wterm/core";
+import type { WasmBridge } from "../core/index.js";
 
 const NORMAL_KEYS: Record<string, string> = {
   ArrowUp: "\x1b[A",
@@ -73,12 +73,16 @@ export class InputHandler {
     this.textarea.setAttribute("enterkeyhint", "send");
     this.textarea.setAttribute("tabindex", "0");
     this.textarea.setAttribute("aria-hidden", "true");
+    // Position at cursor location (updated by positionAtCursor).
+    // Unlike off-screen positioning (left:-9999px), this keeps the textarea
+    // in the visible area so: (1) IME candidate window appears at the cursor,
+    // (2) the browser doesn't scroll the terminal to show the textarea.
     const s = this.textarea.style;
     s.position = "absolute";
-    s.left = "-9999px";
+    s.left = "0";
     s.top = "0";
-    s.width = "1px";
-    s.height = "1px";
+    s.width = "0";
+    s.height = "0";
     s.opacity = "0";
     s.overflow = "hidden";
     s.border = "0";
@@ -137,6 +141,17 @@ export class InputHandler {
     this.textarea.remove();
   }
 
+  /** Move the textarea to the cursor's pixel position so the IME candidate
+   *  window appears at the cursor, and the browser won't scroll the terminal
+   *  to bring an off-screen textarea into view. Called after each render. */
+  positionAtCursor(row: number, col: number, rowHeight: number, charWidth: number): void {
+    const cs = getComputedStyle(this.element);
+    const pl = parseFloat(cs.paddingLeft) || 0;
+    const pt = parseFloat(cs.paddingTop) || 0;
+    this.textarea.style.left = `${pl + col * charWidth}px`;
+    this.textarea.style.top = `${pt + row * rowHeight}px`;
+  }
+
   private handleKeyDown(e: KeyboardEvent): void {
     if (this.composing) return;
 
@@ -165,6 +180,14 @@ export class InputHandler {
       return;
     }
 
+    // For single printable chars without Ctrl/Meta, let the browser handle
+    // the key event. This allows IME composition to start (the first keydown
+    // of an IME session has the actual keyCode, not 229). The typed character
+    // will be processed by handleInput instead of keyToSequence.
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+      return;
+    }
+
     e.preventDefault();
     const seq = this.keyToSequence(e);
     if (seq) this.onData(seq);
@@ -177,8 +200,6 @@ export class InputHandler {
 
     const bridge = this.getBridge();
     if (bridge && bridge.bracketedPaste()) {
-      // Strip ESC bytes so clipboard payloads cannot inject \x1b[201~ to
-      // break out of bracketed paste mode and smuggle commands to the PTY.
       const safe = text.replace(/\x1b/g, "");
       this.onData("\x1b[200~" + safe + "\x1b[201~");
     } else {

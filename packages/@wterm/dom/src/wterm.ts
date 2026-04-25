@@ -1,4 +1,4 @@
-import { WasmBridge } from "@wterm/core";
+import { WasmBridge } from "../core/index.js";
 import { Renderer } from "./renderer.js";
 import { InputHandler } from "./input.js";
 import { DebugAdapter } from "./debug.js";
@@ -195,8 +195,19 @@ export class WTerm {
 
     if (this._shouldScrollToBottom) {
       this._scrollToBottom();
-    } else if (!hasScrollback && this.element.scrollTop !== 0) {
-      this.element.scrollTop = 0;
+    }
+
+    // Position the hidden textarea at the cursor so the IME candidate window
+    // appears at the cursor and the browser doesn't scroll the terminal.
+    if (this.input) {
+      const cursor = this.bridge.getCursor();
+      const charWidth = this._measureCharSize()?.charWidth
+        || parseFloat(getComputedStyle(this.element).fontSize) * 0.6;
+      this.input.positionAtCursor(
+        cursor.row, cursor.col,
+        this._rowHeight || 17,
+        charWidth,
+      );
     }
 
     const title = this.bridge.getTitle();
