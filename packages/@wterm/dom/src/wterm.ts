@@ -30,13 +30,29 @@ export class WTerm {
   private rafId: number | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private _destroyed = false;
-  private _shouldScrollToBottom = false;
+  private _shouldScrollToBottom = true;
+  private _programmaticScroll = false;
   private _rowHeight = 0;
   private _onClickFocus: () => void;
+  private _onScroll!: () => void;
 
   onData: ((data: string) => void) | null;
   onTitle: ((title: string) => void) | null;
   onResize: ((cols: number, rows: number) => void) | null;
+
+  // Cached layout values — NEVER read clientHeight/scrollHeight during
+  // rendering as they force synchronous layout recalculation (layout thrashing).
+  // clientHeight is updated only from ResizeObserver (contentRect is free).
+  // maxScroll is computed from scrollback row count × row height.
+  private _cachedClientHeight = 0;
+  private _cachedMaxScroll = 0;
+  private _lastScrollbackCount = 0;
+  private _lastCursorRow = -1;
+  private _lastCursorCol = -1;
+  private _lastCursorScrollTop = -1;
+  private _hadScrollback = false;
+  private _charWidth = 9;
+  private _cachedScrollTop = 0;
 
   private _container: HTMLDivElement;
 
@@ -61,8 +77,6 @@ export class WTerm {
     this._onClickFocus = () => {
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed) {
-        // Save scroll position before focus — mobile browsers may scroll the
-        // terminal to show the focused textarea even with preventScroll:true.
         const saved = this.element.scrollTop;
         this.input?.focus();
         if (this.element.scrollTop !== saved) {
@@ -71,6 +85,33 @@ export class WTerm {
       }
     };
     this.element.addEventListener("click", this._onClickFocus);
+
+    this._onScroll = () => {
+      // Cache scrollTop from the scroll event — the browser has already
+      // computed layout for this event, so reading scrollTop is cheap here.
+      this._cachedScrollTop = this.element.scrollTop;
+
+      if (!this.element.classList.contains("has-scrollback")) {
+        // No scrollback — prevent any scrolling and reset to bottom.
+        this._shouldScrollToBottom = true;
+        this._scheduleRender();
+      } else {
+        // With scrollback — check if user scrolled to bottom.
+        // If at bottom, set the flag so new output auto-scrolls.
+        // If scrolled up, clear the flag so output doesn't force the user down.
+        const rh = this._rowHeight || 19;
+        const tolerance = rh;
+        const atBottom = this._cachedMaxScroll - this._cachedScrollTop < tolerance;
+        this._shouldScrollToBottom = atBottom;
+        // Virtual scrolling: user scroll changes visible range, need to re-render.
+        // Skip if this scroll was triggered by _scrollToBottom() to avoid
+        // feedback loops (programmatic scroll → scroll event → render → scroll).
+        if (!this._programmaticScroll) {
+          this._scheduleRender();
+        }
+      }
+    };
+    this.element.addEventListener("scroll", this._onScroll, { passive: true });
   }
 
   async init(): Promise<this> {
@@ -86,6 +127,7 @@ export class WTerm {
       }
 
       this._setRowHeight();
+      this._measureAndSetCharWidth();
 
       this.renderer = new Renderer(this._container);
       this.renderer.setup(this.cols, this.rows);
@@ -93,7 +135,9 @@ export class WTerm {
       this.input = new InputHandler(
         this.element,
         (data) => {
-          this._scrollToBottom();
+          // Keyboard input should always scroll to the bottom so the user can
+          // see the command line and echo output, even if they scrolled up.
+          this._shouldScrollToBottom = true;
           if (this.onData) {
             this.onData(data);
           } else {
@@ -122,25 +166,24 @@ export class WTerm {
   }
 
   private _isScrolledToBottom(): boolean {
-    const el = this.element;
-    return el.scrollHeight - el.scrollTop - el.clientHeight < 5;
-  }
-
-  private _scrollToBottom(): void {
-    const el = this.element;
-    const maxScroll = el.scrollHeight - el.clientHeight;
-    if (maxScroll <= 0) {
-      el.scrollTop = 0;
-      return;
+    // Use cached maxScroll and cached scrollTop instead of reading
+    // scrollHeight/clientHeight/scrollTop which force synchronous layout.
+    if (this._cachedClientHeight === 0) {
+      // Not yet rendered, assume at bottom
+      return true;
     }
-    const rh = this._rowHeight || 17;
-    el.scrollTop = Math.floor(maxScroll / rh) * rh;
+    const tolerance = this._rowHeight || 19;
+    return this._cachedMaxScroll - this._cachedScrollTop < tolerance;
   }
 
   write(data: string | Uint8Array): void {
     if (!this.bridge) return;
     if (this.debug) this.debug.traceWrite(data);
-    this._shouldScrollToBottom = this._isScrolledToBottom();
+    // Auto-scroll to bottom when new data arrives, but only if the user
+    // hasn't scrolled up (i.e. we were already at the bottom).
+    // Uses cached scroll position from the scroll event handler to avoid
+    // reading scrollTop which can force synchronous layout.
+    if (this._isScrolledToBottom()) this._shouldScrollToBottom = true;
     if (typeof data === "string") {
       this.bridge.writeString(data);
     } else {
@@ -151,21 +194,16 @@ export class WTerm {
 
   resize(cols: number, rows: number): void {
     if (!this.bridge) return;
-    // Only upgrade _shouldScrollToBottom — never downgrade.
-    // When multiple resize events fire before the render (e.g. mobile keyboard
-    // animation), setup() clears innerHTML which resets scrollTop to 0, causing
-    // subsequent _isScrolledToBottom() checks to return false. By only upgrading,
-    // we preserve the original scroll-to-bottom intent.
-    if (this._isScrolledToBottom()) {
+    // When the grid shrinks (e.g. mobile keyboard appearing), always scroll
+    // to the bottom so the user can see the command line behind the keyboard.
+    // Otherwise, only upgrade _shouldScrollToBottom — never downgrade.
+    if (rows < this.rows || this._isScrolledToBottom()) {
       this._shouldScrollToBottom = true;
     }
     this.cols = cols;
     this.rows = rows;
     this.bridge.resize(cols, rows);
     this.renderer?.setup(cols, rows);
-    // Render immediately instead of scheduling. setup() clears innerHTML which
-    // resets scrollTop to 0; rendering now avoids a visible flash of scrolled-
-    // to-top content between the clear and the next animation frame.
     if (this.rafId != null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
@@ -192,12 +230,66 @@ export class WTerm {
   }
 
   private _initialRender(): void {
+    // Initial clientHeight read — only happens once at init.
+    // After this, ResizeObserver keeps _cachedClientHeight up to date
+    // without forcing layout during rendering.
+    if (this._cachedClientHeight === 0) {
+      this._cachedClientHeight = this.element.clientHeight;
+    }
     this._doRender();
   }
 
   private _doRender(): void {
     if (!this.bridge || !this.renderer) return;
 
+    const rh = this._rowHeight || 19;
+    const scrollbackCount = this.bridge.getScrollbackCount();
+    const hasScrollback = scrollbackCount > 0;
+    const hadScrollbackBefore = this._hadScrollback;
+
+    // Only toggle class when state actually changes — avoids per-frame
+    // attribute mutation observers and potential repaints.
+    if (hasScrollback !== this._hadScrollback) {
+      this.element.classList.toggle("has-scrollback", hasScrollback);
+      this._hadScrollback = hasScrollback;
+    }
+
+    const scrollbackChanged = scrollbackCount !== this._lastScrollbackCount;
+    // Only update paddingBottom when has-scrollback state toggles.
+    if (hasScrollback !== hadScrollbackBefore) {
+      const extraSpace = this._cachedClientHeight - this.rows * rh;
+      this._container.style.paddingBottom = hasScrollback ? `${extraSpace}px` : "";
+    }
+    if (scrollbackChanged) {
+      this._lastScrollbackCount = scrollbackCount;
+    }
+
+    // Determine the effective scroll position for rendering.
+    // When auto-scrolling to bottom, we must use the TARGET scroll position
+    // (maxScroll) so the renderer creates visible rows for the bottom of the
+    // scrollback. We cannot scroll BEFORE rendering because the DOM content
+    // height depends on what the renderer renders — the browser would clamp
+    // scrollTop to the old content height.
+    let renderScrollTop = this._cachedScrollTop;
+    let needAutoScroll = false;
+
+    if (hasScrollback) {
+      this._cachedMaxScroll = scrollbackCount * rh;
+      if (this._shouldScrollToBottom) {
+        renderScrollTop = this._cachedMaxScroll;
+        needAutoScroll = true;
+      }
+    } else {
+      this._cachedMaxScroll = 0;
+      if (scrollbackChanged && this._lastScrollbackCount > 0) {
+        this.element.scrollTop = 0;
+        this._cachedScrollTop = 0;
+      }
+    }
+
+    // Render with the effective scroll position. The renderer creates visible
+    // scrollback rows for this position, so the DOM content height will be
+    // correct for the target scroll position.
     let dirtyCount = 0;
     const t0 = this.debug ? performance.now() : 0;
     if (this.debug) {
@@ -206,23 +298,42 @@ export class WTerm {
       }
     }
 
-    this.renderer.render(this.bridge);
+    this.renderer.render(this.bridge, renderScrollTop, this._cachedClientHeight, rh);
 
     if (this.debug) {
       this.debug.recordRender(performance.now() - t0, dirtyCount);
     }
 
-    const hasScrollback = this.bridge.getScrollbackCount() > 0;
-    this.element.classList.toggle("has-scrollback", hasScrollback);
-
-    if (this._shouldScrollToBottom) {
-      this._scrollToBottom();
+    // After rendering, the DOM has the correct content height. Now we can
+    // safely set the actual scroll position without browser clamping.
+    if (needAutoScroll) {
+      this._programmaticScroll = true;
+      this.element.scrollTop = this._cachedMaxScroll;
+      this._cachedScrollTop = this._cachedMaxScroll;
+      this._programmaticScroll = false;
+      this._shouldScrollToBottom = false;
     }
 
-    // Position the hidden textarea at the cursor so the IME candidate window
-    // appears at the cursor and the browser doesn't scroll the terminal.
+    // Position the hidden textarea at the cursor for IME support.
+    // Only reposition when the cursor moved, scrollback changed, or scroll
+    // position changed — avoids forced reflow (getBoundingClientRect) on
+    // every render frame. Virtual scrolling makes scroll changes affect cursor
+    // position, so we track scrollTop changes too.
     if (this.input) {
-      this.input.positionAtCursor();
+      const cursor = this.bridge.getCursor();
+      const scrollTopChanged = this._cachedScrollTop !== this._lastCursorScrollTop;
+      if (cursor.row !== this._lastCursorRow ||
+          cursor.col !== this._lastCursorCol ||
+          scrollbackChanged ||
+          scrollTopChanged) {
+        this._lastCursorRow = cursor.row;
+        this._lastCursorCol = cursor.col;
+        this._lastCursorScrollTop = this._cachedScrollTop;
+        this.input.positionAtCursor(
+          cursor.row, cursor.col, scrollbackCount, this._cachedClientHeight,
+          this._cachedScrollTop,
+        );
+      }
     }
 
     const title = this.bridge.getTitle();
@@ -266,6 +377,23 @@ export class WTerm {
     }
   }
 
+  private _measureAndSetCharWidth(): void {
+    const probe = document.createElement("span");
+    probe.className = "term-row";
+    probe.style.visibility = "hidden";
+    probe.style.position = "absolute";
+    probe.textContent = "W";
+    this._container.appendChild(probe);
+    const w = probe.getBoundingClientRect().width;
+    probe.remove();
+    if (w > 0) {
+      this._charWidth = w;
+      if (this.input) {
+        this.input.setLayoutMetrics(this._rowHeight, this._charWidth);
+      }
+    }
+  }
+
   private _measureCharSize(): {
     charWidth: number;
     rowHeight: number;
@@ -286,6 +414,10 @@ export class WTerm {
 
     if (charWidth === 0 || rowHeight === 0) return null;
     this._rowHeight = rowHeight;
+    this._charWidth = charWidth;
+    if (this.input) {
+      this.input.setLayoutMetrics(this._rowHeight, this._charWidth);
+    }
     return { charWidth, rowHeight };
   }
 
@@ -304,6 +436,10 @@ export class WTerm {
 
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
+        // Cache clientHeight from ResizeObserver — contentRect is computed
+        // from the observer's cached layout data and does NOT force a
+        // synchronous reflow like reading element.clientHeight would.
+        this._cachedClientHeight = Math.round(height);
         const newCols = Math.max(1, Math.floor(width / charWidth));
         const newRows = Math.max(1, Math.floor(height / rowHeight));
         if (newCols !== this.cols || newRows !== this.rows) {
@@ -320,6 +456,7 @@ export class WTerm {
     if (this.resizeObserver) this.resizeObserver.disconnect();
     if (this.input) this.input.destroy();
     this.element.removeEventListener("click", this._onClickFocus);
+    this.element.removeEventListener("scroll", this._onScroll);
     this.element.innerHTML = "";
     if (
       this.debug &&

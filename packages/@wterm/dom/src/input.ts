@@ -47,6 +47,8 @@ export class InputHandler {
   private onData: (data: string) => void;
   private getBridge: () => WasmBridge | null;
   private composing = false;
+  private _rowHeight = 19;
+  private _charWidth = 9;
 
   private _onKeyDown: (e: KeyboardEvent) => void;
   private _onPaste: (e: ClipboardEvent) => void;
@@ -123,6 +125,13 @@ export class InputHandler {
     this.textarea.focus({ preventScroll: true });
   }
 
+  /** Update layout metrics used for mathematical cursor positioning.
+   *  Called from the parent WTerm when row height or char width changes. */
+  setLayoutMetrics(rowHeight: number, charWidth: number): void {
+    this._rowHeight = rowHeight;
+    this._charWidth = charWidth;
+  }
+
   destroy(): void {
     this.textarea.removeEventListener("keydown", this._onKeyDown);
     this.textarea.removeEventListener("paste", this._onPaste as EventListener);
@@ -141,25 +150,31 @@ export class InputHandler {
     this.textarea.remove();
   }
 
-  /** Position the textarea at the rendered cursor element so the IME candidate
-   *  window appears at the cursor, and the browser won't scroll the terminal
-   *  to bring an off-screen textarea into view. Uses the actual DOM position
-   *  which automatically accounts for scrollback rows, padding, etc.
+  /** Position the textarea at the cursor using mathematical calculation.
+   *  Avoids getBoundingClientRect() which forces synchronous layout (reflow)
+   *  after DOM mutations in the render loop. Instead, computes the position
+   *  from known row/col + cached metrics, which is a pure arithmetic operation.
    *  On mobile, the textarea is clamped to the visible area so the browser
-   *  doesn't scroll to show a textarea that's behind the virtual keyboard. */
-  positionAtCursor(): void {
-    const cursorEl = this.element.querySelector(".term-cursor");
-    if (!cursorEl) return;
-    const termRect = this.element.getBoundingClientRect();
-    const cursorRect = cursorEl.getBoundingClientRect();
-    const left = cursorRect.left - termRect.left + this.element.scrollLeft;
-    let top = cursorRect.top - termRect.top + this.element.scrollTop;
-    // Clamp to visible area to prevent mobile browsers from scrolling the
-    // terminal when the cursor is below the viewport (behind the keyboard).
-    const maxTop = this.element.scrollTop + this.element.clientHeight - 1;
-    const minTop = this.element.scrollTop;
+   *  doesn't scroll to show a textarea that's behind the virtual keyboard.
+   *  Accepts scrollTop as parameter to avoid reading element.scrollTop which
+   *  can force synchronous layout recalculation. */
+  positionAtCursor(row: number, col: number, scrollbackCount: number, clientHeight: number, scrollTop: number): void {
+    const left = col * this._charWidth;
+    // position: absolute inside a scroll container scrolls with the content,
+    // so top must be in scroll-content coordinates (not viewport coordinates).
+    // Subtracting scrollTop here would cause a double offset: the browser
+    // applies the scroll offset when rendering, and we'd have subtracted it
+    // too, placing the textarea far from the actual cursor.
+    let top = (scrollbackCount + row) * this._rowHeight;
+
+    // Clamp to visible area (in scroll-content coordinates) to prevent mobile
+    // browsers from scrolling the terminal to show a textarea that's behind
+    // the virtual keyboard.
+    const maxTop = scrollTop + clientHeight - 1;
+    const minTop = scrollTop;
     if (top > maxTop) top = maxTop;
     if (top < minTop) top = minTop;
+
     this.textarea.style.left = `${left}px`;
     this.textarea.style.top = `${top}px`;
   }

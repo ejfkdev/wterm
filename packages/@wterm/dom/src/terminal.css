@@ -36,6 +36,7 @@
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
   outline: none;
   overflow: hidden;
+  contain: content;
 }
 
 .wterm:focus,
@@ -57,10 +58,13 @@
   contain: layout style;
 }
 
+.term-scrollback-row {
+  content-visibility: auto;
+  contain-intrinsic-height: var(--term-row-height);
+}
+
 .term-row > span {
-  display: inline-block;
-  height: var(--term-row-height);
-  vertical-align: top;
+  display: contents;
 }
 
 .term-block {

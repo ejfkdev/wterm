@@ -6,6 +6,16 @@ export interface CellData {
   wide: number;
 }
 
+/// Reusable cell buffer — avoids allocating a new object per getCell() call.
+/// Use with getCellInto() / getScrollbackCellInto().
+export interface CellBuf {
+  char: number;
+  fg: number;
+  bg: number;
+  flags: number;
+  wide: number;
+}
+
 export interface CursorState {
   row: number;
   col: number;
@@ -121,7 +131,16 @@ export class WasmBridge {
     while (offset < data.length) {
       const chunk = Math.min(data.length - offset, 8192);
       buf.set(data.subarray(offset, offset + chunk));
-      this.exports.writeBytes(chunk);
+      try {
+        this.exports.writeBytes(chunk);
+      } catch (e) {
+        const memPages = this.memory.buffer.byteLength / 65536;
+        console.error(`[wterm] OOB! cols=${this.exports.getCols()} rows=${this.exports.getRows()} ` +
+          `altScreen=${this.exports.getUsingAltScreen()} gridPtr=${this.gridPtr} ` +
+          `memBytes=${this.memory.buffer.byteLength} pages=${memPages} ` +
+          `chunk=${chunk} dataLen=${data.length}`);
+        throw e;
+      }
       offset += chunk;
     }
   }
@@ -138,8 +157,30 @@ export class WasmBridge {
     };
   }
 
+  /// Read cell data into an existing buffer (avoids object allocation).
+  getCellInto(row: number, col: number, out: CellBuf): void {
+    const offset = this.gridPtr + (row * this.maxCols + col) * this.cellSize;
+    const dv = this._dv;
+    out.char = dv.getUint32(offset, true);
+    out.fg = dv.getUint16(offset + 4, true);
+    out.bg = dv.getUint16(offset + 6, true);
+    out.flags = dv.getUint8(offset + 8);
+    out.wide = dv.getUint8(offset + 9);
+  }
+
   isDirtyRow(row: number): boolean {
     return new Uint8Array(this.memory.buffer, this.dirtyPtr, 256)[row] !== 0;
+  }
+
+  /// Get a cached view of the dirty row flags.
+  /// Reuse across isDirtyRow checks within a single render pass.
+  /// Invalidated automatically when WASM memory grows.
+  private _dirtyView: Uint8Array | null = null;
+  getDirtyView(): Uint8Array {
+    if (!this._dirtyView || this._dirtyView.buffer !== this.memory.buffer) {
+      this._dirtyView = new Uint8Array(this.memory.buffer, this.dirtyPtr, 256);
+    }
+    return this._dirtyView;
   }
 
   clearDirty(): void {
@@ -204,6 +245,18 @@ export class WasmBridge {
       flags: dv.getUint8(off + 8),
       wide: dv.getUint8(off + 9),
     };
+  }
+
+  /// Read scrollback cell data into an existing buffer (avoids object allocation).
+  getScrollbackCellInto(offset: number, col: number, out: CellBuf): void {
+    const ptr = this.exports.getScrollbackLine(offset);
+    const off = ptr + col * this.cellSize;
+    const dv = this._dv;
+    out.char = dv.getUint32(off, true);
+    out.fg = dv.getUint16(off + 4, true);
+    out.bg = dv.getUint16(off + 6, true);
+    out.flags = dv.getUint8(off + 8);
+    out.wide = dv.getUint8(off + 9);
   }
 
   getScrollbackLineLen(offset: number): number {

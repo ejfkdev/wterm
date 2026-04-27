@@ -692,9 +692,10 @@ pub const Terminal = struct {
                 while (r < self.rows) : (r += 1) {
                     self.grid.clearRowAs(r, blank);
                 }
-                if (mode == 3) {
-                    if (self.scrollback) |sb| sb.reset();
-                }
+                // Clear scrollback for both mode 2 (ESC[2J) and mode 3 (ESC[3J).
+                // After clearing the screen, stale scrollback rows should not
+                // remain visible in the terminal viewport.
+                if (self.scrollback) |sb| sb.reset();
             },
             else => {},
         }

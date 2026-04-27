@@ -1,4 +1,4 @@
-import type { WasmBridge } from "@wterm/core";
+import type { WasmBridge, CellBuf } from "@wterm/core";
 
 const DEFAULT_COLOR = 256;
 const FLAG_BOLD = 0x01;
@@ -9,6 +9,7 @@ const FLAG_REVERSE = 0x20;
 const FLAG_INVISIBLE = 0x40;
 const FLAG_STRIKETHROUGH = 0x80;
 
+const FLAG_WIDE = 0x01;
 const FLAG_CONTINUATION = 0x02;
 
 function colorToCSS(index: number): string | null {
@@ -55,11 +56,21 @@ function buildCellStyle(fg: number, bg: number, flags: number): string {
   return style;
 }
 
-function appendRun(parent: HTMLElement, text: string, style: string): void {
-  const span = document.createElement("span");
-  if (style) span.style.cssText = style;
-  span.textContent = text;
-  parent.appendChild(span);
+/// Numeric key for (fg, bg, flags) — fast integer comparison for run boundaries.
+function styleKey(fg: number, bg: number, flags: number): number {
+  return ((fg * 257) + bg) * 256 + flags;
+}
+
+/// Cache buildCellStyle results keyed by numeric styleKey.
+const _styleCache = new Map<number, string>();
+
+function getCachedCellStyle(fg: number, bg: number, flags: number): string {
+  const key = styleKey(fg, bg, flags);
+  let cached = _styleCache.get(key);
+  if (cached !== undefined) return cached;
+  cached = buildCellStyle(fg, bg, flags);
+  _styleCache.set(key, cached);
+  return cached;
 }
 
 function resolveColors(
@@ -157,6 +168,13 @@ function getBlockBackground(cp: number, fg: string, bg: string): string {
   }
 }
 
+/// Describes a single span element to render.
+interface RunInfo {
+  text: string;
+  cssText: string;
+  className: string;
+}
+
 export class Renderer {
   private container: HTMLElement;
   private rows = 0;
@@ -168,11 +186,29 @@ export class Renderer {
   private prevContainerBg = "";
   private prevRowBg: string[] = [];
 
+  // Virtual scrolling for scrollback — only render visible rows + buffer.
+  private _topSpacer!: HTMLDivElement;
+  private _bottomSpacer!: HTMLDivElement;
   private _scrollbackRowEls: HTMLDivElement[] = [];
   private _renderedScrollbackCount = 0;
+  private _visibleStart = -1;
+  private _visibleEnd = -1;
+
+  /// Reusable cell buffer — avoids allocating a new object per getCell() call.
+  private _cellBuf: CellBuf = { char: 0, fg: 0, bg: 0, flags: 0, wide: 0 };
+
+  /// Reusable runs array — avoids allocating per-row.
+  private _runs: RunInfo[] = [];
+
+  /// Extra rows rendered above/below viewport for smooth scrolling.
+  private static readonly SCROLL_BUFFER = 10;
 
   constructor(container: HTMLElement) {
     this.container = container;
+  }
+
+  getScrollbackCount(): number {
+    return this._renderedScrollbackCount;
   }
 
   setup(cols: number, rows: number): void {
@@ -183,8 +219,20 @@ export class Renderer {
     this.prevRowBg = [];
     this._scrollbackRowEls = [];
     this._renderedScrollbackCount = 0;
+    this._visibleStart = -1;
+    this._visibleEnd = -1;
+
+    // Spacers for virtual scrolling — maintain correct scroll height
+    // without rendering all scrollback rows as DOM elements.
+    this._topSpacer = document.createElement("div");
+    this._topSpacer.style.height = "0";
+    this._bottomSpacer = document.createElement("div");
+    this._bottomSpacer.style.height = "0";
 
     const fragment = document.createDocumentFragment();
+    fragment.appendChild(this._topSpacer);
+    fragment.appendChild(this._bottomSpacer);
+
     for (let r = 0; r < rows; r++) {
       const rowEl = document.createElement("div");
       rowEl.className = "term-row";
@@ -198,99 +246,112 @@ export class Renderer {
 
   private _buildRowContent(
     rowEl: HTMLDivElement,
-    getCell: (col: number) => {
-      char: number;
-      fg: number;
-      bg: number;
-      flags: number;
-      wide: number;
-    },
+    getCell: (col: number, out: CellBuf) => void,
     lineLen: number,
     cursorCol: number,
     rowIndex: number,
   ): void {
-    rowEl.textContent = "";
+    const c = this._cellBuf;
+    const runs = this._runs;
+    runs.length = 0;
 
     // If cursor is on a continuation cell, snap it back to the wide character
     let effectiveCursorCol = cursorCol;
     if (cursorCol >= 1) {
-      const cc = getCell(cursorCol);
-      if (cc.wide & FLAG_CONTINUATION) effectiveCursorCol = cursorCol - 1;
+      getCell(cursorCol, c);
+      if (c.wide & FLAG_CONTINUATION) effectiveCursorCol = cursorCol - 1;
     }
 
+    // Phase 1: Collect runs into an array (no DOM manipulation)
+    let runStyleKey = 0;
     let runStyle = "";
-    let runText = "";
+    let runChars: string[] = [];
     let runLogicalStart = 0;
     let logicalCol = 0;
     let cursorLogicalCol = -1;
 
     const flushRun = (endLogical: number) => {
-      if (!runText) return;
+      const text = runChars.join("");
+      if (!text) return;
 
       if (cursorLogicalCol >= runLogicalStart && cursorLogicalCol < endLogical) {
         const offset = cursorLogicalCol - runLogicalStart;
-        const before = runText.slice(0, offset);
-        const cursorChar = runText[offset];
-        const after = runText.slice(offset + 1);
+        const before = text.slice(0, offset);
+        const cursorChar = text[offset];
+        const after = text.slice(offset + 1);
 
-        if (before) appendRun(rowEl, before, runStyle);
-
-        const cursorSpan = document.createElement("span");
-        cursorSpan.className = "term-cursor";
-        if (runStyle) cursorSpan.style.cssText = runStyle;
-        cursorSpan.textContent = cursorChar;
-        rowEl.appendChild(cursorSpan);
-
-        if (after) appendRun(rowEl, after, runStyle);
+        if (before) runs.push({ text: before, cssText: runStyle, className: "" });
+        runs.push({ text: cursorChar, cssText: runStyle, className: "term-cursor" });
+        if (after) runs.push({ text: after, cssText: runStyle, className: "" });
       } else {
-        appendRun(rowEl, runText, runStyle);
+        runs.push({ text, cssText: runStyle, className: "" });
       }
     };
 
     for (let col = 0; col < this.cols; col++) {
-      const cell = getCell(col);
+      getCell(col, c);
       const inBounds = col < lineLen;
 
-      // Track cursor logical position
       if (col === effectiveCursorCol && cursorLogicalCol < 0) {
         cursorLogicalCol = logicalCol;
       }
 
-      // Skip continuation cells — they are rendered as part of the wide char
-      if (inBounds && (cell.wide & FLAG_CONTINUATION)) {
+      if (inBounds && (c.wide & FLAG_CONTINUATION)) {
         continue;
       }
 
-      const cp = inBounds ? cell.char : 0;
+      const cp = inBounds ? c.char : 0;
 
       if (inBounds && cp >= 0x2580 && cp <= 0x259f) {
         flushRun(logicalCol);
 
-        const colors = resolveColors(cell.fg, cell.bg, cell.flags);
-        const span = document.createElement("span");
-        span.className =
-          col === effectiveCursorCol ? "term-block term-cursor" : "term-block";
-        span.style.background = getBlockBackground(cp, colors.fg, colors.bg);
-        if (cell.flags & FLAG_DIM) span.style.opacity = "0.5";
-        rowEl.appendChild(span);
+        const colors = resolveColors(c.fg, c.bg, c.flags);
+        const isCursor = col === effectiveCursorCol;
+        let cssText = `background:${getBlockBackground(cp, colors.fg, colors.bg)}`;
+        if (c.flags & FLAG_DIM) cssText += ";opacity:0.5";
+        runs.push({
+          text: "",
+          cssText,
+          className: isCursor ? "term-block term-cursor" : "term-block",
+        });
 
+        runStyleKey = 0;
         runStyle = "";
-        runText = "";
+        runChars = [];
+        runLogicalStart = logicalCol + 1;
+        logicalCol++;
+      } else if (inBounds && (c.wide & FLAG_WIDE)) {
+        flushRun(logicalCol);
+
+        const ch = cp >= 32 ? String.fromCodePoint(cp) : " ";
+        const style = getCachedCellStyle(c.fg, c.bg, c.flags);
+        const isCursor = col === effectiveCursorCol;
+        runs.push({
+          text: ch,
+          cssText: style,
+          className: isCursor ? "term-wide term-cursor" : "term-wide",
+        });
+
+        runStyleKey = 0;
+        runStyle = "";
+        runChars = [];
         runLogicalStart = logicalCol + 1;
         logicalCol++;
       } else {
         const ch = inBounds && cp >= 32 ? String.fromCodePoint(cp) : " ";
-        const style = inBounds
-          ? buildCellStyle(cell.fg, cell.bg, cell.flags)
+        const curStyleKey = inBounds ? styleKey(c.fg, c.bg, c.flags) : 0;
+        const curStyle = inBounds
+          ? getCachedCellStyle(c.fg, c.bg, c.flags)
           : "";
 
-        if (style !== runStyle) {
+        if (curStyleKey !== runStyleKey) {
           flushRun(logicalCol);
-          runStyle = style;
-          runText = ch;
+          runStyleKey = curStyleKey;
+          runStyle = curStyle;
+          runChars = [ch];
           runLogicalStart = logicalCol;
         } else {
-          runText += ch;
+          runChars.push(ch);
         }
         logicalCol++;
       }
@@ -303,15 +364,60 @@ export class Renderer {
 
     flushRun(logicalCol);
 
+    // Phase 2: Apply runs to row element
+    // Fast path: if run count matches existing children count and all classNames
+    // match, update existing spans in place — no DOM node creation/destruction.
+    // This handles the common case where a row's style runs stay the same between
+    // frames (e.g., plain text, colored prompt) and only the content changes.
+    const runCount = runs.length;
+    const existing = rowEl.children;
+    const existingCount = existing.length;
+    let canReuse = existingCount === runCount;
+
+    if (canReuse) {
+      for (let i = 0; i < runCount; i++) {
+        if ((existing[i] as HTMLElement).className !== runs[i].className) {
+          canReuse = false;
+          break;
+        }
+      }
+    }
+
+    if (canReuse) {
+      // Fast path: update existing spans in place — zero DOM node alloc/free
+      for (let i = 0; i < runCount; i++) {
+        const child = existing[i] as HTMLElement;
+        const run = runs[i];
+        if (child.style.cssText !== run.cssText) {
+          child.style.cssText = run.cssText;
+        }
+        if (child.textContent !== run.text) {
+          child.textContent = run.text;
+        }
+      }
+    } else {
+      // Slow path: rebuild with DocumentFragment + replaceChildren.
+      // Single atomic DOM operation — avoids layout thrashing from
+      // textContent="" followed by individual appendChild calls.
+      const frag = document.createDocumentFragment();
+      for (let i = 0; i < runCount; i++) {
+        const run = runs[i];
+        const span = document.createElement("span");
+        if (run.className) span.className = run.className;
+        if (run.cssText) span.style.cssText = run.cssText;
+        if (run.text) span.textContent = run.text;
+        frag.appendChild(span);
+      }
+      rowEl.replaceChildren(frag);
+    }
+
     // Extend the row background when the line fills the full width.
-    // When lineLen < cols, bgCss stays "" which clears any stale bg
-    // via the prevRowBg comparison below.
     let bgCss = "";
     if (lineLen >= this.cols && this.cols > 0) {
-      const lastCell = getCell(this.cols - 1);
-      let bgC = lastCell.bg;
-      if (lastCell.flags & FLAG_REVERSE) {
-        bgC = lastCell.fg;
+      getCell(this.cols - 1, c);
+      let bgC = c.bg;
+      if (c.flags & FLAG_REVERSE) {
+        bgC = c.fg;
         if (bgC === DEFAULT_COLOR) bgC = 7;
       }
       bgCss = colorToCSS(bgC) || "";
@@ -332,14 +438,17 @@ export class Renderer {
   private _buildScrollbackRowEl(
     bridge: WasmBridge,
     sbOffset: number,
+    rowEl?: HTMLDivElement,
   ): HTMLDivElement {
-    const rowEl = document.createElement("div");
-    rowEl.className = "term-row term-scrollback-row";
+    if (!rowEl) {
+      rowEl = document.createElement("div");
+      rowEl.className = "term-row term-scrollback-row";
+    }
     const lineLen = bridge.getScrollbackLineLen(sbOffset);
 
     this._buildRowContent(
       rowEl,
-      (col) => bridge.getScrollbackCell(sbOffset, col),
+      (col, out) => bridge.getScrollbackCellInto(sbOffset, col, out),
       lineLen,
       -1,
       -1,
@@ -347,35 +456,149 @@ export class Renderer {
     return rowEl;
   }
 
-  private syncScrollback(bridge: WasmBridge): void {
+  /** Virtual scrolling with row reuse: instead of destroying and recreating all
+   *  scrollback row DOM elements every frame, reuse existing elements by updating
+   *  their content in-place. Only add/remove elements at the edges of the visible
+   *  range. This drastically reduces DOM mutations and eliminates the layout/paint
+   *  cost of destroying/creating dozens of DOM nodes per frame. */
+  private _syncVirtualScrollback(
+    bridge: WasmBridge,
+    scrollTop: number,
+    clientHeight: number,
+    rh: number,
+  ): void {
     const scrollbackCount = bridge.getScrollbackCount();
 
-    if (scrollbackCount === this._renderedScrollbackCount) return;
+    if (scrollbackCount === 0) {
+      // No scrollback — clear everything
+      if (this._scrollbackRowEls.length > 0) {
+        for (const el of this._scrollbackRowEls) el.remove();
+        this._scrollbackRowEls = [];
+      }
+      this._topSpacer.style.height = "0";
+      this._bottomSpacer.style.height = "0";
+      this._renderedScrollbackCount = 0;
+      this._visibleStart = -1;
+      this._visibleEnd = -1;
+      return;
+    }
 
-    if (scrollbackCount > this._renderedScrollbackCount) {
-      const newCount = scrollbackCount - this._renderedScrollbackCount;
-      const firstGridRow = this.rowEls[0] ?? null;
+    // Calculate visible range with buffer for smooth scrolling.
+    const BUFFER = Renderer.SCROLL_BUFFER;
+    const visStart = Math.max(0, Math.floor(scrollTop / rh) - BUFFER);
+    const visEnd = Math.min(
+      scrollbackCount,
+      Math.ceil((scrollTop + clientHeight) / rh) + BUFFER,
+    );
+
+    // Skip if nothing changed
+    if (
+      scrollbackCount === this._renderedScrollbackCount &&
+      visStart === this._visibleStart &&
+      visEnd === this._visibleEnd
+    ) {
+      return;
+    }
+
+    const oldStart = this._visibleStart;
+    const oldEnd = this._visibleEnd;
+    const oldCount = this._scrollbackRowEls.length;
+
+    if (oldCount === 0 || oldStart < 0) {
+      // First render or full rebuild needed — create all rows
       const fragment = document.createDocumentFragment();
-
-      for (let i = newCount - 1; i >= 0; i--) {
+      for (let i = visStart; i < visEnd; i++) {
         const rowEl = this._buildScrollbackRowEl(bridge, i);
         fragment.appendChild(rowEl);
         this._scrollbackRowEls.push(rowEl);
       }
-
-      this.container.insertBefore(fragment, firstGridRow);
+      this._topSpacer.style.height = `${visStart * rh}px`;
+      this._topSpacer.after(fragment);
+      this._bottomSpacer.style.height = `${(scrollbackCount - visEnd) * rh}px`;
+    } else if (oldStart === visStart && oldEnd === visEnd && scrollbackCount !== this._renderedScrollbackCount) {
+      // Same visible range but scrollback grew — just update bottom spacer
+      this._bottomSpacer.style.height = `${(scrollbackCount - visEnd) * rh}px`;
     } else {
-      const removeCount = this._renderedScrollbackCount - scrollbackCount;
-      for (let i = 0; i < removeCount; i++) {
-        const el = this._scrollbackRowEls.shift();
-        if (el) el.remove();
+      // Incremental update: reuse existing row elements where possible
+
+      // Calculate the overlap between old and new ranges
+      const overlapStart = Math.max(oldStart, visStart);
+      const overlapEnd = Math.min(oldEnd, visEnd);
+
+      if (overlapStart < overlapEnd && oldCount > 0) {
+        // There's an overlap — reuse rows in the overlap region
+        const newEls: HTMLDivElement[] = [];
+
+        // Prepend new rows before the overlap
+        if (visStart < oldStart) {
+          const fragment = document.createDocumentFragment();
+          for (let i = visStart; i < oldStart; i++) {
+            const rowEl = this._buildScrollbackRowEl(bridge, i);
+            fragment.appendChild(rowEl);
+            newEls.push(rowEl);
+          }
+          this._topSpacer.after(fragment);
+        }
+
+        // Reuse rows in the overlap region — update content in place
+        const reuseStartIdx = Math.max(0, overlapStart - oldStart);
+        const reuseEndIdx = Math.min(oldCount, overlapEnd - oldStart);
+        for (let i = reuseStartIdx; i < reuseEndIdx; i++) {
+          const sbOffset = oldStart + i;
+          const newOffset = sbOffset; // Same offset in new range since we're in the overlap
+          if (sbOffset >= visStart && sbOffset < visEnd) {
+            const rowEl = this._scrollbackRowEls[i];
+            this._buildScrollbackRowEl(bridge, newOffset, rowEl);
+            newEls.push(rowEl);
+          }
+        }
+
+        // Append new rows after the overlap
+        if (visEnd > oldEnd) {
+          const fragment = document.createDocumentFragment();
+          for (let i = oldEnd; i < visEnd; i++) {
+            const rowEl = this._buildScrollbackRowEl(bridge, i);
+            fragment.appendChild(rowEl);
+            newEls.push(rowEl);
+          }
+          this._bottomSpacer.before(fragment);
+        }
+
+        // Remove rows that fell out of the visible range
+        // Rows before the overlap
+        for (let i = 0; i < reuseStartIdx; i++) {
+          this._scrollbackRowEls[i].remove();
+        }
+        // Rows after the overlap
+        for (let i = reuseEndIdx; i < oldCount; i++) {
+          this._scrollbackRowEls[i].remove();
+        }
+
+        this._scrollbackRowEls = newEls;
+      } else {
+        // No overlap — full rebuild
+        for (const el of this._scrollbackRowEls) el.remove();
+        this._scrollbackRowEls = [];
+
+        const fragment = document.createDocumentFragment();
+        for (let i = visStart; i < visEnd; i++) {
+          const rowEl = this._buildScrollbackRowEl(bridge, i);
+          fragment.appendChild(rowEl);
+          this._scrollbackRowEls.push(rowEl);
+        }
+        this._topSpacer.after(fragment);
       }
+
+      this._topSpacer.style.height = `${visStart * rh}px`;
+      this._bottomSpacer.style.height = `${(scrollbackCount - visEnd) * rh}px`;
     }
 
     this._renderedScrollbackCount = scrollbackCount;
+    this._visibleStart = visStart;
+    this._visibleEnd = visEnd;
   }
 
-  render(bridge: WasmBridge): void {
+  render(bridge: WasmBridge, scrollTop = 0, clientHeight = 0, rh = 19): void {
     const rows = bridge.getRows();
     const cols = bridge.getCols();
 
@@ -385,7 +608,7 @@ export class Renderer {
       resized = true;
     }
 
-    this.syncScrollback(bridge);
+    this._syncVirtualScrollback(bridge, scrollTop, clientHeight, rh);
 
     const cursor = bridge.getCursor();
     const cursorVisible = cursor.visible;
@@ -393,8 +616,11 @@ export class Renderer {
     const needsCursorUpdate =
       cursor.row !== this.prevCursorRow || cursor.col !== this.prevCursorCol;
 
+    // Cache dirty array view — avoids creating a new Uint8Array per isDirtyRow() call.
+    const dirtyArr = bridge.getDirtyView();
+
     for (let r = 0; r < this.rows; r++) {
-      const isDirty = resized || bridge.isDirtyRow(r);
+      const isDirty = resized || dirtyArr[r] !== 0;
       const hadCursor = r === this.prevCursorRow && needsCursorUpdate;
       const hasCursor = r === cursor.row;
 
@@ -402,7 +628,7 @@ export class Renderer {
         const cCol = hasCursor && cursorVisible ? cursor.col : -1;
         this._buildRowContent(
           this.rowEls[r],
-          (col) => bridge.getCell(r, col),
+          (col, out) => bridge.getCellInto(r, col, out),
           this.cols,
           cCol,
           r,
@@ -415,12 +641,13 @@ export class Renderer {
 
     // Update the container background only when the last row was actually
     // repainted, avoiding stale reads during partial mid-redraw frames.
-    const lastRowDirty = resized || bridge.isDirtyRow(this.rows - 1);
+    const lastRowDirty = resized || dirtyArr[this.rows - 1] !== 0;
     if (lastRowDirty) {
-      const bottomRight = bridge.getCell(this.rows - 1, this.cols - 1);
-      let gridBg = bottomRight.bg;
-      if (bottomRight.flags & FLAG_REVERSE) {
-        gridBg = bottomRight.fg;
+      bridge.getCellInto(this.rows - 1, this.cols - 1, this._cellBuf);
+      const c = this._cellBuf;
+      let gridBg = c.bg;
+      if (c.flags & FLAG_REVERSE) {
+        gridBg = c.fg;
         if (gridBg === DEFAULT_COLOR) gridBg = 7;
       }
       const containerBg = colorToCSS(gridBg) || "";
