@@ -21,6 +21,8 @@ export interface TerminalProps extends Omit<
   cursorBlink?: boolean;
   /** Enable debug mode (init-only — changing after mount has no effect). */
   debug?: boolean;
+  /** Minimum render interval in ms. 0 = every frame (default). */
+  minRenderInterval?: number;
   onData?: (data: string) => void;
   onTitle?: (title: string) => void;
   onResize?: (cols: number, rows: number) => void;
@@ -32,6 +34,7 @@ export interface TerminalHandle {
   write(data: string | Uint8Array): void;
   resize(cols: number, rows: number): void;
   focus(): void;
+  flush(): void;
   readonly instance: WTerm | null;
 }
 
@@ -44,6 +47,7 @@ const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
     autoResize = false,
     cursorBlink = false,
     debug = false,
+    minRenderInterval,
     onData,
     onTitle,
     onResize,
@@ -78,6 +82,9 @@ const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
     focus() {
       wtermRef.current?.focus();
     },
+    flush() {
+      wtermRef.current?.flush();
+    },
     get instance() {
       return wtermRef.current;
     },
@@ -96,6 +103,7 @@ const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
         autoResize: autoResizeRef.current,
         cursorBlink,
         debug,
+        minRenderInterval,
         onData: callbacksRef.current.onData
           ? (data: string) => callbacksRef.current.onData?.(data)
           : undefined,

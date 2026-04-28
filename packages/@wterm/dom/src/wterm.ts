@@ -10,6 +10,12 @@ export interface WTermOptions {
   autoResize?: boolean;
   cursorBlink?: boolean;
   debug?: boolean;
+  /** Minimum interval in ms between render frames triggered by write().
+   *  0 = render every animation frame (default).
+   *  Set to e.g. 200 to throttle renders to at most once per 200ms.
+   *  User input (keystrokes) always triggers an immediate render.
+   *  Resize renders are not throttled. */
+  minRenderInterval?: number;
   onData?: (data: string) => void;
   onTitle?: (title: string) => void;
   onResize?: (cols: number, rows: number) => void;
@@ -54,6 +60,12 @@ export class WTerm {
   private _charWidth = 9;
   private _cachedScrollTop = 0;
 
+  // Render throttling
+  private _minRenderInterval = 0;
+  private _lastRenderTime = 0;
+  private _throttleTimerId: ReturnType<typeof setTimeout> | null = null;
+  private _inputPending = false;
+
   private _container: HTMLDivElement;
 
   constructor(element: HTMLElement, options: WTermOptions = {}) {
@@ -63,6 +75,7 @@ export class WTerm {
     this.rows = options.rows || 24;
     this.autoResize = options.autoResize !== false;
     this._debugEnabled = options.debug ?? false;
+    this._minRenderInterval = options.minRenderInterval ?? 0;
 
     this.onData = options.onData || null;
     this.onTitle = options.onTitle || null;
@@ -138,6 +151,8 @@ export class WTerm {
           // Keyboard input should always scroll to the bottom so the user can
           // see the command line and echo output, even if they scrolled up.
           this._shouldScrollToBottom = true;
+          // Mark that user input is pending so the next render bypasses throttle.
+          this._inputPending = true;
           if (this.onData) {
             this.onData(data);
           } else {
@@ -204,11 +219,13 @@ export class WTerm {
     this.rows = rows;
     this.bridge.resize(cols, rows);
     this.renderer?.setup(cols, rows);
+    this._cancelPendingRender();
     if (this.rafId != null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
     this._doRender();
+    this._lastRenderTime = performance.now();
     if (this.onResize) this.onResize(cols, rows);
   }
 
@@ -221,11 +238,64 @@ export class WTerm {
   }
 
   private _scheduleRender(): void {
-    if (this.rafId == null) {
-      this.rafId = requestAnimationFrame(() => {
+    // If user input is pending, bypass throttle and render immediately.
+    if (this._inputPending) {
+      this._inputPending = false;
+      this._cancelPendingRender();
+      if (this.rafId != null) {
+        cancelAnimationFrame(this.rafId);
         this.rafId = null;
-        this._doRender();
-      });
+      }
+      this._doRender();
+      this._lastRenderTime = performance.now();
+      return;
+    }
+
+    // If throttle is disabled (0ms), use original rAF behavior.
+    const interval = this._minRenderInterval;
+    if (interval <= 0) {
+      if (this.rafId == null) {
+        this.rafId = requestAnimationFrame(() => {
+          this.rafId = null;
+          this._doRender();
+        });
+      }
+      return;
+    }
+
+    // Throttle is active — check if enough time has elapsed since last render.
+    const now = performance.now();
+    const remaining = interval - (now - this._lastRenderTime);
+
+    if (remaining <= 0) {
+      // Enough time passed — schedule via rAF (aligned to vsync).
+      this._cancelPendingRender();
+      if (this.rafId == null) {
+        this.rafId = requestAnimationFrame(() => {
+          this.rafId = null;
+          this._doRender();
+          this._lastRenderTime = performance.now();
+        });
+      }
+    } else if (this._throttleTimerId == null && this.rafId == null) {
+      // Not enough time — defer scheduling until the interval expires.
+      this._throttleTimerId = setTimeout(() => {
+        this._throttleTimerId = null;
+        if (this.rafId == null) {
+          this.rafId = requestAnimationFrame(() => {
+            this.rafId = null;
+            this._doRender();
+            this._lastRenderTime = performance.now();
+          });
+        }
+      }, remaining);
+    }
+  }
+
+  private _cancelPendingRender(): void {
+    if (this._throttleTimerId != null) {
+      clearTimeout(this._throttleTimerId);
+      this._throttleTimerId = null;
     }
   }
 
@@ -237,6 +307,7 @@ export class WTerm {
       this._cachedClientHeight = this.element.clientHeight;
     }
     this._doRender();
+    this._lastRenderTime = performance.now();
   }
 
   private _doRender(): void {
@@ -450,9 +521,22 @@ export class WTerm {
     this.resizeObserver.observe(this.element);
   }
 
+  /** Force an immediate render, bypassing any throttle. */
+  flush(): void {
+    this._inputPending = false;
+    this._cancelPendingRender();
+    if (this.rafId != null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+    this._doRender();
+    this._lastRenderTime = performance.now();
+  }
+
   destroy(): void {
     this._destroyed = true;
     if (this.rafId != null) cancelAnimationFrame(this.rafId);
+    if (this._throttleTimerId != null) clearTimeout(this._throttleTimerId);
     if (this.resizeObserver) this.resizeObserver.disconnect();
     if (this.input) this.input.destroy();
     this.element.removeEventListener("click", this._onClickFocus);

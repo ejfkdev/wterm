@@ -200,6 +200,30 @@ export class Renderer {
   /// Reusable runs array — avoids allocating per-row.
   private _runs: RunInfo[] = [];
 
+  /// Pre-allocated RunInfo pool — avoids creating short-lived objects each frame.
+  private _runPool: RunInfo[] = [];
+  private _runPoolUsed = 0;
+
+  /// Acquire a RunInfo from the pool (or create a new one if pool is empty).
+  private _acquireRun(text: string, cssText: string, className: string): RunInfo {
+    if (this._runPoolUsed < this._runPool.length) {
+      const run = this._runPool[this._runPoolUsed++];
+      run.text = text;
+      run.cssText = cssText;
+      run.className = className;
+      return run;
+    }
+    const run: RunInfo = { text, cssText, className };
+    this._runPool.push(run);
+    this._runPoolUsed++;
+    return run;
+  }
+
+  /// Reset the pool for a new row — allows reusing RunInfo objects.
+  private _resetPool(): void {
+    this._runPoolUsed = 0;
+  }
+
   /// Extra rows rendered above/below viewport for smooth scrolling.
   private static readonly SCROLL_BUFFER = 10;
 
@@ -254,6 +278,7 @@ export class Renderer {
     const c = this._cellBuf;
     const runs = this._runs;
     runs.length = 0;
+    this._resetPool();
 
     // If cursor is on a continuation cell, snap it back to the wide character
     let effectiveCursorCol = cursorCol;
@@ -280,11 +305,11 @@ export class Renderer {
         const cursorChar = text[offset];
         const after = text.slice(offset + 1);
 
-        if (before) runs.push({ text: before, cssText: runStyle, className: "" });
-        runs.push({ text: cursorChar, cssText: runStyle, className: "term-cursor" });
-        if (after) runs.push({ text: after, cssText: runStyle, className: "" });
+        if (before) runs.push(this._acquireRun(before, runStyle, ""));
+        runs.push(this._acquireRun(cursorChar, runStyle, "term-cursor"));
+        if (after) runs.push(this._acquireRun(after, runStyle, ""));
       } else {
-        runs.push({ text, cssText: runStyle, className: "" });
+        runs.push(this._acquireRun(text, runStyle, ""));
       }
     };
 
@@ -309,11 +334,11 @@ export class Renderer {
         const isCursor = col === effectiveCursorCol;
         let cssText = `background:${getBlockBackground(cp, colors.fg, colors.bg)}`;
         if (c.flags & FLAG_DIM) cssText += ";opacity:0.5";
-        runs.push({
-          text: "",
+        runs.push(this._acquireRun(
+          "",
           cssText,
-          className: isCursor ? "term-block term-cursor" : "term-block",
-        });
+          isCursor ? "term-block term-cursor" : "term-block",
+        ));
 
         runStyleKey = 0;
         runStyle = "";
@@ -326,11 +351,11 @@ export class Renderer {
         const ch = cp >= 32 ? String.fromCodePoint(cp) : " ";
         const style = getCachedCellStyle(c.fg, c.bg, c.flags);
         const isCursor = col === effectiveCursorCol;
-        runs.push({
-          text: ch,
-          cssText: style,
-          className: isCursor ? "term-wide term-cursor" : "term-wide",
-        });
+        runs.push(this._acquireRun(
+          ch,
+          style,
+          isCursor ? "term-wide term-cursor" : "term-wide",
+        ));
 
         runStyleKey = 0;
         runStyle = "";
@@ -365,29 +390,25 @@ export class Renderer {
     flushRun(logicalCol);
 
     // Phase 2: Apply runs to row element
-    // Fast path: if run count matches existing children count and all classNames
-    // match, update existing spans in place — no DOM node creation/destruction.
-    // This handles the common case where a row's style runs stay the same between
-    // frames (e.g., plain text, colored prompt) and only the content changes.
+    // If run count matches existing child count, update spans in place —
+    // no DOM node creation/destruction. This handles the common cases:
+    // - Text changes with same style structure (plain text, colored prompt)
+    // - Cursor movement (className changes on individual spans)
+    // - Style changes on existing runs (cssText updates)
+    // Only fall through to the slow path (replaceChildren) when the number
+    // of runs changed — i.e. the DOM structure itself must change.
     const runCount = runs.length;
     const existing = rowEl.children;
     const existingCount = existing.length;
-    let canReuse = existingCount === runCount;
 
-    if (canReuse) {
-      for (let i = 0; i < runCount; i++) {
-        if ((existing[i] as HTMLElement).className !== runs[i].className) {
-          canReuse = false;
-          break;
-        }
-      }
-    }
-
-    if (canReuse) {
+    if (existingCount === runCount) {
       // Fast path: update existing spans in place — zero DOM node alloc/free
       for (let i = 0; i < runCount; i++) {
         const child = existing[i] as HTMLElement;
         const run = runs[i];
+        if (child.className !== run.className) {
+          child.className = run.className;
+        }
         if (child.style.cssText !== run.cssText) {
           child.style.cssText = run.cssText;
         }
@@ -397,8 +418,7 @@ export class Renderer {
       }
     } else {
       // Slow path: rebuild with DocumentFragment + replaceChildren.
-      // Single atomic DOM operation — avoids layout thrashing from
-      // textContent="" followed by individual appendChild calls.
+      // Only needed when the number of style runs changed.
       const frag = document.createDocumentFragment();
       for (let i = 0; i < runCount; i++) {
         const run = runs[i];

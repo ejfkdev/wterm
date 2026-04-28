@@ -182,28 +182,23 @@ export class InputHandler {
   private handleKeyDown(e: KeyboardEvent): void {
     if (this.composing) return;
 
-    if ((e.metaKey || e.ctrlKey) && e.key === "c") {
-      const sel = window.getSelection();
-      if (sel && sel.toString().length > 0) return;
+    // Cmd+C: browser native copy
+    if (e.metaKey && !e.ctrlKey && !e.shiftKey && e.key === "c") return;
+    // Cmd+Shift+C: send SIGINT
+    if (e.metaKey && !e.ctrlKey && e.shiftKey && e.key === "C") {
+      e.preventDefault();
+      this.onData("\x03");
+      return;
     }
-    if ((e.metaKey || e.ctrlKey) && e.key === "v") {
+    // Cmd+V: browser native paste
+    if (e.metaKey && !e.ctrlKey && e.key === "v") {
       this.textarea.focus();
       return;
     }
-    if (e.metaKey && !e.ctrlKey) {
-      if (e.key === "Backspace") {
-        e.preventDefault();
-        this.onData("\x15");
-      } else if (e.key === "a") {
-        e.preventDefault();
-        const sel = window.getSelection();
-        if (sel) {
-          const range = document.createRange();
-          range.selectNodeContents(this.element);
-          sel.removeAllRanges();
-          sel.addRange(range);
-        }
-      }
+    // Cmd+K: clear screen (macOS convention, maps to Ctrl+L not Ctrl+K)
+    if (e.metaKey && !e.ctrlKey && e.key === "k") {
+      e.preventDefault();
+      this.onData("\x0c");
       return;
     }
 
@@ -254,7 +249,10 @@ export class InputHandler {
   }
 
   private keyToSequence(e: KeyboardEvent): string | null {
-    if (e.ctrlKey && !e.altKey && !e.metaKey) {
+    // On macOS, Cmd maps to Ctrl for terminal control characters
+    const ctrl = e.ctrlKey || (e.metaKey && !e.ctrlKey);
+
+    if (ctrl && !e.altKey) {
       if (e.key.length === 1) {
         const code = e.key.toLowerCase().charCodeAt(0);
         if (code >= 97 && code <= 122) return String.fromCharCode(code - 96);
@@ -264,6 +262,16 @@ export class InputHandler {
       if (e.key === "]") return "\x1d";
       if (e.key === "^") return "\x1e";
       if (e.key === "_") return "\x1f";
+      // Cmd/Ctrl+Backspace/Delete → Ctrl+U (kill line)
+      if (e.key === "Backspace" || e.key === "Delete") return "\x15";
+    }
+
+    // Cmd+Arrow → Home/End/PageUp/PageDown (macOS line/page movement)
+    if (e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (e.key === "ArrowLeft") return "\x1b[H";
+      if (e.key === "ArrowRight") return "\x1b[F";
+      if (e.key === "ArrowUp") return "\x1b[5~";
+      if (e.key === "ArrowDown") return "\x1b[6~";
     }
 
     if (e.key === "Enter" && e.shiftKey) return "\x1b[13;2u";

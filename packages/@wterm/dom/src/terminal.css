@@ -48,14 +48,14 @@
   display: block;
   white-space: pre;
   contain: layout paint style;
-  will-change: contents;
+  will-change: transform;
 }
 
 .term-row {
   display: block;
   height: var(--term-row-height);
   line-height: var(--term-row-height);
-  contain: layout style;
+  contain: strict;
 }
 
 .term-scrollback-row {
