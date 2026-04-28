@@ -75,7 +75,7 @@ export class WTerm {
     this.rows = options.rows || 24;
     this.autoResize = options.autoResize !== false;
     this._debugEnabled = options.debug ?? false;
-    this._minRenderInterval = options.minRenderInterval ?? 0;
+    this._minRenderInterval = options.minRenderInterval ?? 100;
 
     this.onData = options.onData || null;
     this.onTitle = options.onTitle || null;
