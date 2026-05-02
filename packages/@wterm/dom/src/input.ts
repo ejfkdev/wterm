@@ -187,6 +187,7 @@ export class InputHandler {
     // Cmd+Shift+C: send SIGINT
     if (e.metaKey && !e.ctrlKey && e.shiftKey && e.key === "C") {
       e.preventDefault();
+      e.stopPropagation();
       this.onData("\x03");
       return;
     }
@@ -198,6 +199,7 @@ export class InputHandler {
     // Cmd+K: clear screen (macOS convention, maps to Ctrl+L not Ctrl+K)
     if (e.metaKey && !e.ctrlKey && e.key === "k") {
       e.preventDefault();
+      e.stopPropagation();
       this.onData("\x0c");
       return;
     }
@@ -211,6 +213,7 @@ export class InputHandler {
     }
 
     e.preventDefault();
+    e.stopPropagation();
     const seq = this.keyToSequence(e);
     if (seq) this.onData(seq);
   }

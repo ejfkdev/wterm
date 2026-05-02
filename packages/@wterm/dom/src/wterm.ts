@@ -1,7 +1,7 @@
 import { WasmBridge } from "@wterm/core";
 import { Renderer } from "./renderer.js";
 import { InputHandler } from "./input.js";
-import { DebugAdapter } from "./debug.js";
+import type { DebugAdapter } from "./debug.js";
 
 export interface WTermOptions {
   cols?: number;
@@ -105,9 +105,9 @@ export class WTerm {
       this._cachedScrollTop = this.element.scrollTop;
 
       if (!this.element.classList.contains("has-scrollback")) {
-        // No scrollback — prevent any scrolling and reset to bottom.
+        // No scrollback — just ensure the flag stays true. No render needed
+        // since all rows are always visible and there's nothing to scroll.
         this._shouldScrollToBottom = true;
-        this._scheduleRender();
       } else {
         // With scrollback — check if user scrolled to bottom.
         // If at bottom, set the flag so new output auto-scrolls.
@@ -134,7 +134,8 @@ export class WTerm {
       this.bridge.init(this.cols, this.rows);
 
       if (this._debugEnabled) {
-        this.debug = new DebugAdapter();
+        const { DebugAdapter: DA } = await import("./debug.js");
+        this.debug = new DA();
         this.debug.setBridge(this.bridge);
         (globalThis as Record<string, unknown>).__wterm = this;
       }
@@ -170,6 +171,27 @@ export class WTerm {
 
       this.input.focus();
       this._initialRender();
+
+      // Re-measure after custom fonts load — initial measurement may use
+      // a fallback font with different metrics, causing wrong column count.
+      // ResizeObserver won't fire because the element width is determined
+      // by its parent, not by its content, so font changes don't trigger it.
+      document.fonts.ready.then(() => {
+        if (this._destroyed || !this.autoResize) return;
+        const measured = this._measureCharSize();
+        if (!measured) return;
+        const w = this.element.clientWidth;
+        const h = this._cachedClientHeight;
+        const cs = getComputedStyle(this.element);
+        const pl = parseFloat(cs.paddingLeft) || 0;
+        const pr = parseFloat(cs.paddingRight) || 0;
+        const contentWidth = w - pl - pr;
+        const newCols = Math.max(1, Math.floor(contentWidth / measured.charWidth));
+        const newRows = Math.max(1, Math.floor(h / measured.rowHeight));
+        if (newCols !== this.cols || newRows !== this.rows) {
+          this.resize(newCols, newRows);
+        }
+      });
     } catch (err) {
       this.destroy();
       throw new Error(
@@ -449,14 +471,15 @@ export class WTerm {
   }
 
   private _measureAndSetCharWidth(): void {
-    const probe = document.createElement("span");
-    probe.className = "term-row";
-    probe.style.visibility = "hidden";
-    probe.style.position = "absolute";
-    probe.textContent = "W";
-    this._container.appendChild(probe);
-    const w = probe.getBoundingClientRect().width;
-    probe.remove();
+    // Use CSS ch unit — same as _measureCharSize but only measures charWidth.
+    // The old method (<span class="term-row">W</span>) was broken because
+    // .term-row is display:block, so getBoundingClientRect().width returned
+    // the full row width instead of the character advance width.
+    const chProbe = document.createElement("div");
+    chProbe.style.cssText = "position:absolute;visibility:hidden;width:100ch";
+    this._container.appendChild(chProbe);
+    const w = chProbe.getBoundingClientRect().width / 100;
+    chProbe.remove();
     if (w > 0) {
       this._charWidth = w;
       if (this.input) {
@@ -469,17 +492,23 @@ export class WTerm {
     charWidth: number;
     rowHeight: number;
   } | null {
+    // Use CSS ch unit for charWidth — it directly reflects the font's
+    // advance width, avoiding inline-block layout quirks that can make
+    // a <span>W</span> measure wider than the actual character advance.
+    const chProbe = document.createElement("div");
+    chProbe.style.cssText = "position:absolute;visibility:hidden;width:100ch";
+    this._container.appendChild(chProbe);
+    const charWidth = chProbe.getBoundingClientRect().width / 100;
+    chProbe.remove();
+
     const row = document.createElement("div");
     row.className = "term-row";
     row.style.visibility = "hidden";
     row.style.position = "absolute";
-
-    const probe = document.createElement("span");
-    probe.textContent = "W";
-    row.appendChild(probe);
-
+    const textProbe = document.createElement("span");
+    textProbe.textContent = "M";
+    row.appendChild(textProbe);
     this._container.appendChild(row);
-    const charWidth = probe.getBoundingClientRect().width;
     const rowHeight = row.getBoundingClientRect().height;
     row.remove();
 
@@ -507,9 +536,6 @@ export class WTerm {
 
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
-        // Cache clientHeight from ResizeObserver — contentRect is computed
-        // from the observer's cached layout data and does NOT force a
-        // synchronous reflow like reading element.clientHeight would.
         this._cachedClientHeight = Math.round(height);
         const newCols = Math.max(1, Math.floor(width / charWidth));
         const newRows = Math.max(1, Math.floor(height / rowHeight));

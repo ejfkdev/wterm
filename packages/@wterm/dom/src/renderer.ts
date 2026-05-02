@@ -58,16 +58,18 @@ function buildCellStyle(fg: number, bg: number, flags: number): string {
 
 /// Numeric key for (fg, bg, flags) — fast integer comparison for run boundaries.
 function styleKey(fg: number, bg: number, flags: number): number {
-  return ((fg * 257) + bg) * 256 + flags;
+  return (fg * 257 + bg) * 256 + flags;
 }
 
 /// Cache buildCellStyle results keyed by numeric styleKey.
 const _styleCache = new Map<number, string>();
+const _STYLE_CACHE_MAX = 4096;
 
 function getCachedCellStyle(fg: number, bg: number, flags: number): string {
   const key = styleKey(fg, bg, flags);
   let cached = _styleCache.get(key);
   if (cached !== undefined) return cached;
+  if (_styleCache.size >= _STYLE_CACHE_MAX) _styleCache.clear();
   cached = buildCellStyle(fg, bg, flags);
   _styleCache.set(key, cached);
   return cached;
@@ -173,6 +175,8 @@ interface RunInfo {
   text: string;
   cssText: string;
   className: string;
+  styleKey: number;
+  colCount: number;
 }
 
 export class Renderer {
@@ -186,7 +190,9 @@ export class Renderer {
   private prevContainerBg = "";
   private prevRowBg: string[] = [];
 
-  // Virtual scrolling for scrollback — only render visible rows + buffer.
+  private _spanStyleKeys = new WeakMap<HTMLElement, number>();
+
+  // Virtual scrolling for scrollback
   private _topSpacer!: HTMLDivElement;
   private _bottomSpacer!: HTMLDivElement;
   private _scrollbackRowEls: HTMLDivElement[] = [];
@@ -194,37 +200,39 @@ export class Renderer {
   private _visibleStart = -1;
   private _visibleEnd = -1;
 
-  /// Reusable cell buffer — avoids allocating a new object per getCell() call.
   private _cellBuf: CellBuf = { char: 0, fg: 0, bg: 0, flags: 0, wide: 0 };
-
-  /// Reusable runs array — avoids allocating per-row.
+  private _cpScan: Uint32Array = new Uint32Array(0);
+  private _wideScan: Uint8Array = new Uint8Array(0);
   private _runs: RunInfo[] = [];
-
-  /// Pre-allocated RunInfo pool — avoids creating short-lived objects each frame.
   private _runPool: RunInfo[] = [];
   private _runPoolUsed = 0;
 
-  /// Acquire a RunInfo from the pool (or create a new one if pool is empty).
-  private _acquireRun(text: string, cssText: string, className: string): RunInfo {
+  private _acquireRun(
+    text: string,
+    cssText: string,
+    className: string,
+    styleKey: number,
+    colCount: number,
+  ): RunInfo {
     if (this._runPoolUsed < this._runPool.length) {
       const run = this._runPool[this._runPoolUsed++];
       run.text = text;
       run.cssText = cssText;
       run.className = className;
+      run.styleKey = styleKey;
+      run.colCount = colCount;
       return run;
     }
-    const run: RunInfo = { text, cssText, className };
+    const run: RunInfo = { text, cssText, className, styleKey, colCount };
     this._runPool.push(run);
     this._runPoolUsed++;
     return run;
   }
 
-  /// Reset the pool for a new row — allows reusing RunInfo objects.
   private _resetPool(): void {
     this._runPoolUsed = 0;
   }
 
-  /// Extra rows rendered above/below viewport for smooth scrolling.
   private static readonly SCROLL_BUFFER = 10;
 
   constructor(container: HTMLElement) {
@@ -245,9 +253,8 @@ export class Renderer {
     this._renderedScrollbackCount = 0;
     this._visibleStart = -1;
     this._visibleEnd = -1;
+    this._spanStyleKeys = new WeakMap();
 
-    // Spacers for virtual scrolling — maintain correct scroll height
-    // without rendering all scrollback rows as DOM elements.
     this._topSpacer = document.createElement("div");
     this._topSpacer.style.height = "0";
     this._bottomSpacer = document.createElement("div");
@@ -280,145 +287,152 @@ export class Renderer {
     runs.length = 0;
     this._resetPool();
 
-    // If cursor is on a continuation cell, snap it back to the wide character
+    const cols = this.cols;
+    if (this._cpScan.length < cols) {
+      this._cpScan = new Uint32Array(cols);
+      this._wideScan = new Uint8Array(cols);
+    }
+    const cpScan = this._cpScan;
+    const wideScan = this._wideScan;
+    for (let col = 0; col < cols; col++) {
+      getCell(col, c);
+      cpScan[col] = c.char;
+      wideScan[col] = c.wide;
+    }
+
     let effectiveCursorCol = cursorCol;
     if (cursorCol >= 1) {
       getCell(cursorCol, c);
       if (c.wide & FLAG_CONTINUATION) effectiveCursorCol = cursorCol - 1;
     }
 
-    // Phase 1: Collect runs into an array (no DOM manipulation)
-    let runStyleKey = 0;
-    let runStyle = "";
-    let runChars: string[] = [];
-    let runLogicalStart = 0;
-    let logicalCol = 0;
-    let cursorLogicalCol = -1;
-
-    const flushRun = (endLogical: number) => {
-      const text = runChars.join("");
-      if (!text) return;
-
-      if (cursorLogicalCol >= runLogicalStart && cursorLogicalCol < endLogical) {
-        const offset = cursorLogicalCol - runLogicalStart;
-        const before = text.slice(0, offset);
-        const cursorChar = text[offset];
-        const after = text.slice(offset + 1);
-
-        if (before) runs.push(this._acquireRun(before, runStyle, ""));
-        runs.push(this._acquireRun(cursorChar, runStyle, "term-cursor"));
-        if (after) runs.push(this._acquireRun(after, runStyle, ""));
-      } else {
-        runs.push(this._acquireRun(text, runStyle, ""));
-      }
-    };
-
-    for (let col = 0; col < this.cols; col++) {
-      getCell(col, c);
+    // Phase 1: Collect runs — one span per single-width cell to ensure
+    // each glyph occupies exactly 1ch in layout, preventing wide symbols
+    // (✶ ✳ ⏺ etc.) from shifting subsequent content.  Glyphs may visually
+    // overflow their cell (matching Ghostty's behavior) but the layout
+    // width is strictly 1ch.
+    for (let col = 0; col < cols; col++) {
+      const cp = cpScan[col];
+      const wide = wideScan[col];
       const inBounds = col < lineLen;
 
-      if (col === effectiveCursorCol && cursorLogicalCol < 0) {
-        cursorLogicalCol = logicalCol;
-      }
+      if (inBounds && wide & FLAG_CONTINUATION) continue;
 
-      if (inBounds && (c.wide & FLAG_CONTINUATION)) {
-        continue;
-      }
+      const effectiveCp = inBounds ? cp : 0;
+      const isCursor = col === effectiveCursorCol;
 
-      const cp = inBounds ? c.char : 0;
-
-      if (inBounds && cp >= 0x2580 && cp <= 0x259f) {
-        flushRun(logicalCol);
-
+      if (inBounds && effectiveCp >= 0x2580 && effectiveCp <= 0x259f) {
+        // Block elements: render as background gradient, no text
+        getCell(col, c);
         const colors = resolveColors(c.fg, c.bg, c.flags);
-        const isCursor = col === effectiveCursorCol;
-        let cssText = `background:${getBlockBackground(cp, colors.fg, colors.bg)}`;
+        let cssText = `background:${getBlockBackground(effectiveCp, colors.fg, colors.bg)}`;
         if (c.flags & FLAG_DIM) cssText += ";opacity:0.5";
-        runs.push(this._acquireRun(
-          "",
-          cssText,
-          isCursor ? "term-block term-cursor" : "term-block",
-        ));
-
-        runStyleKey = 0;
-        runStyle = "";
-        runChars = [];
-        runLogicalStart = logicalCol + 1;
-        logicalCol++;
-      } else if (inBounds && (c.wide & FLAG_WIDE)) {
-        flushRun(logicalCol);
-
-        const ch = cp >= 32 ? String.fromCodePoint(cp) : " ";
+        runs.push(
+          this._acquireRun(
+            "",
+            cssText,
+            isCursor ? "term-block term-cursor" : "term-block",
+            -1,
+            1,
+          ),
+        );
+      } else if (inBounds && wide & FLAG_WIDE) {
+        // Wide characters: 2ch span
+        getCell(col, c);
+        const ch = effectiveCp >= 32 ? String.fromCodePoint(effectiveCp) : " ";
         const style = getCachedCellStyle(c.fg, c.bg, c.flags);
-        const isCursor = col === effectiveCursorCol;
-        runs.push(this._acquireRun(
-          ch,
-          style,
-          isCursor ? "term-wide term-cursor" : "term-wide",
-        ));
-
-        runStyleKey = 0;
-        runStyle = "";
-        runChars = [];
-        runLogicalStart = logicalCol + 1;
-        logicalCol++;
+        const sk = styleKey(c.fg, c.bg, c.flags);
+        runs.push(
+          this._acquireRun(
+            ch,
+            style,
+            isCursor ? "term-wide term-cursor" : "term-wide",
+            sk,
+            2,
+          ),
+        );
       } else {
-        const ch = inBounds && cp >= 32 ? String.fromCodePoint(cp) : " ";
-        const curStyleKey = inBounds ? styleKey(c.fg, c.bg, c.flags) : 0;
-        const curStyle = inBounds
+        // Normal single-width: one span per character, fixed 1ch layout
+        getCell(col, c);
+        const ch =
+          inBounds && effectiveCp >= 32
+            ? String.fromCodePoint(effectiveCp)
+            : " ";
+        const style = inBounds
           ? getCachedCellStyle(c.fg, c.bg, c.flags)
           : "";
-
-        if (curStyleKey !== runStyleKey) {
-          flushRun(logicalCol);
-          runStyleKey = curStyleKey;
-          runStyle = curStyle;
-          runChars = [ch];
-          runLogicalStart = logicalCol;
-        } else {
-          runChars.push(ch);
-        }
-        logicalCol++;
+        const sk = inBounds ? styleKey(c.fg, c.bg, c.flags) : 0;
+        const base = style ? style + ";" : "";
+        runs.push(
+          this._acquireRun(
+            ch,
+            base + "width:1ch",
+            isCursor ? "term-cursor" : "",
+            sk,
+            1,
+          ),
+        );
       }
     }
 
-    // Handle cursor at the end of line
-    if (cursorCol >= this.cols - 1 && cursorLogicalCol < 0) {
-      cursorLogicalCol = logicalCol;
-    }
-
-    flushRun(logicalCol);
-
-    // Phase 2: Apply runs to row element
-    // If run count matches existing child count, update spans in place —
-    // no DOM node creation/destruction. This handles the common cases:
-    // - Text changes with same style structure (plain text, colored prompt)
-    // - Cursor movement (className changes on individual spans)
-    // - Style changes on existing runs (cssText updates)
-    // Only fall through to the slow path (replaceChildren) when the number
-    // of runs changed — i.e. the DOM structure itself must change.
+    // Phase 2: Apply runs to DOM — always reset cssText to prevent stale inline styles
     const runCount = runs.length;
     const existing = rowEl.children;
     const existingCount = existing.length;
 
     if (existingCount === runCount) {
-      // Fast path: update existing spans in place — zero DOM node alloc/free
       for (let i = 0; i < runCount; i++) {
         const child = existing[i] as HTMLElement;
         const run = runs[i];
-        if (child.className !== run.className) {
-          child.className = run.className;
+        const classChanged = child.className !== run.className;
+        const prevSk = this._spanStyleKeys.get(child);
+        const styleChanged = prevSk !== run.styleKey;
+        if (!styleChanged && !classChanged) {
+          const tn = child.firstChild as Text | null;
+          if (tn) {
+            if (tn.nodeValue !== run.text) tn.nodeValue = run.text;
+          } else if (run.text) child.textContent = run.text;
+          continue;
         }
-        if (child.style.cssText !== run.cssText) {
-          child.style.cssText = run.cssText;
+        if (classChanged) child.className = run.className;
+        // Always reset cssText when anything changed to clear stale inline styles
+        child.style.cssText = run.cssText;
+        this._spanStyleKeys.set(child, run.styleKey);
+        const tn = child.firstChild as Text | null;
+        if (tn) {
+          if (tn.nodeValue !== run.text) tn.nodeValue = run.text;
+        } else if (run.text) child.textContent = run.text;
+      }
+    } else if (existingCount > 0) {
+      const minCount = Math.min(existingCount, runCount);
+      for (let i = 0; i < minCount; i++) {
+        const run = runs[i];
+        const child = existing[i] as HTMLElement;
+        if (child.className !== run.className) child.className = run.className;
+        child.style.cssText = run.cssText;
+        this._spanStyleKeys.set(child, run.styleKey);
+        const tn = child.firstChild as Text | null;
+        if (tn) {
+          if (tn.nodeValue !== run.text) tn.nodeValue = run.text;
+        } else if (run.text) child.textContent = run.text;
+      }
+      if (runCount > existingCount) {
+        const frag = document.createDocumentFragment();
+        for (let i = existingCount; i < runCount; i++) {
+          const run = runs[i];
+          const span = document.createElement("span");
+          if (run.className) span.className = run.className;
+          if (run.cssText) span.style.cssText = run.cssText;
+          if (run.text) span.textContent = run.text;
+          if (run.styleKey !== 0) this._spanStyleKeys.set(span, run.styleKey);
+          frag.appendChild(span);
         }
-        if (child.textContent !== run.text) {
-          child.textContent = run.text;
-        }
+        rowEl.appendChild(frag);
+      }
+      while (rowEl.children.length > runCount) {
+        rowEl.lastChild!.remove();
       }
     } else {
-      // Slow path: rebuild with DocumentFragment + replaceChildren.
-      // Only needed when the number of style runs changed.
       const frag = document.createDocumentFragment();
       for (let i = 0; i < runCount; i++) {
         const run = runs[i];
@@ -426,12 +440,13 @@ export class Renderer {
         if (run.className) span.className = run.className;
         if (run.cssText) span.style.cssText = run.cssText;
         if (run.text) span.textContent = run.text;
+        if (run.styleKey !== 0) this._spanStyleKeys.set(span, run.styleKey);
         frag.appendChild(span);
       }
-      rowEl.replaceChildren(frag);
+      rowEl.appendChild(frag);
     }
 
-    // Extend the row background when the line fills the full width.
+    // Row background
     let bgCss = "";
     if (lineLen >= this.cols && this.cols > 0) {
       getCell(this.cols - 1, c);
@@ -476,11 +491,6 @@ export class Renderer {
     return rowEl;
   }
 
-  /** Virtual scrolling with row reuse: instead of destroying and recreating all
-   *  scrollback row DOM elements every frame, reuse existing elements by updating
-   *  their content in-place. Only add/remove elements at the edges of the visible
-   *  range. This drastically reduces DOM mutations and eliminates the layout/paint
-   *  cost of destroying/creating dozens of DOM nodes per frame. */
   private _syncVirtualScrollback(
     bridge: WasmBridge,
     scrollTop: number,
@@ -490,7 +500,6 @@ export class Renderer {
     const scrollbackCount = bridge.getScrollbackCount();
 
     if (scrollbackCount === 0) {
-      // No scrollback — clear everything
       if (this._scrollbackRowEls.length > 0) {
         for (const el of this._scrollbackRowEls) el.remove();
         this._scrollbackRowEls = [];
@@ -503,7 +512,6 @@ export class Renderer {
       return;
     }
 
-    // Calculate visible range with buffer for smooth scrolling.
     const BUFFER = Renderer.SCROLL_BUFFER;
     const visStart = Math.max(0, Math.floor(scrollTop / rh) - BUFFER);
     const visEnd = Math.min(
@@ -511,7 +519,6 @@ export class Renderer {
       Math.ceil((scrollTop + clientHeight) / rh) + BUFFER,
     );
 
-    // Skip if nothing changed
     if (
       scrollbackCount === this._renderedScrollbackCount &&
       visStart === this._visibleStart &&
@@ -520,89 +527,81 @@ export class Renderer {
       return;
     }
 
+    const sbOffset = (pos: number) => scrollbackCount - 1 - pos;
+
     const oldStart = this._visibleStart;
     const oldEnd = this._visibleEnd;
     const oldCount = this._scrollbackRowEls.length;
 
     if (oldCount === 0 || oldStart < 0) {
-      // First render or full rebuild needed — create all rows
       const fragment = document.createDocumentFragment();
       for (let i = visStart; i < visEnd; i++) {
-        const rowEl = this._buildScrollbackRowEl(bridge, i);
+        const rowEl = this._buildScrollbackRowEl(bridge, sbOffset(i));
         fragment.appendChild(rowEl);
         this._scrollbackRowEls.push(rowEl);
       }
       this._topSpacer.style.height = `${visStart * rh}px`;
       this._topSpacer.after(fragment);
       this._bottomSpacer.style.height = `${(scrollbackCount - visEnd) * rh}px`;
-    } else if (oldStart === visStart && oldEnd === visEnd && scrollbackCount !== this._renderedScrollbackCount) {
-      // Same visible range but scrollback grew — just update bottom spacer
+    } else if (
+      oldStart === visStart &&
+      oldEnd === visEnd &&
+      scrollbackCount !== this._renderedScrollbackCount
+    ) {
       this._bottomSpacer.style.height = `${(scrollbackCount - visEnd) * rh}px`;
     } else {
-      // Incremental update: reuse existing row elements where possible
-
-      // Calculate the overlap between old and new ranges
       const overlapStart = Math.max(oldStart, visStart);
       const overlapEnd = Math.min(oldEnd, visEnd);
 
       if (overlapStart < overlapEnd && oldCount > 0) {
-        // There's an overlap — reuse rows in the overlap region
         const newEls: HTMLDivElement[] = [];
 
-        // Prepend new rows before the overlap
         if (visStart < oldStart) {
           const fragment = document.createDocumentFragment();
           for (let i = visStart; i < oldStart; i++) {
-            const rowEl = this._buildScrollbackRowEl(bridge, i);
+            const rowEl = this._buildScrollbackRowEl(bridge, sbOffset(i));
             fragment.appendChild(rowEl);
             newEls.push(rowEl);
           }
           this._topSpacer.after(fragment);
         }
 
-        // Reuse rows in the overlap region — update content in place
         const reuseStartIdx = Math.max(0, overlapStart - oldStart);
         const reuseEndIdx = Math.min(oldCount, overlapEnd - oldStart);
         for (let i = reuseStartIdx; i < reuseEndIdx; i++) {
-          const sbOffset = oldStart + i;
-          const newOffset = sbOffset; // Same offset in new range since we're in the overlap
-          if (sbOffset >= visStart && sbOffset < visEnd) {
+          const domPos = oldStart + i;
+          if (domPos >= visStart && domPos < visEnd) {
             const rowEl = this._scrollbackRowEls[i];
-            this._buildScrollbackRowEl(bridge, newOffset, rowEl);
+            this._buildScrollbackRowEl(bridge, sbOffset(domPos), rowEl);
             newEls.push(rowEl);
           }
         }
 
-        // Append new rows after the overlap
         if (visEnd > oldEnd) {
           const fragment = document.createDocumentFragment();
           for (let i = oldEnd; i < visEnd; i++) {
-            const rowEl = this._buildScrollbackRowEl(bridge, i);
+            const rowEl = this._buildScrollbackRowEl(bridge, sbOffset(i));
             fragment.appendChild(rowEl);
             newEls.push(rowEl);
           }
           this._bottomSpacer.before(fragment);
         }
 
-        // Remove rows that fell out of the visible range
-        // Rows before the overlap
         for (let i = 0; i < reuseStartIdx; i++) {
           this._scrollbackRowEls[i].remove();
         }
-        // Rows after the overlap
         for (let i = reuseEndIdx; i < oldCount; i++) {
           this._scrollbackRowEls[i].remove();
         }
 
         this._scrollbackRowEls = newEls;
       } else {
-        // No overlap — full rebuild
         for (const el of this._scrollbackRowEls) el.remove();
         this._scrollbackRowEls = [];
 
         const fragment = document.createDocumentFragment();
         for (let i = visStart; i < visEnd; i++) {
-          const rowEl = this._buildScrollbackRowEl(bridge, i);
+          const rowEl = this._buildScrollbackRowEl(bridge, sbOffset(i));
           fragment.appendChild(rowEl);
           this._scrollbackRowEls.push(rowEl);
         }
@@ -636,7 +635,6 @@ export class Renderer {
     const needsCursorUpdate =
       cursor.row !== this.prevCursorRow || cursor.col !== this.prevCursorCol;
 
-    // Cache dirty array view — avoids creating a new Uint8Array per isDirtyRow() call.
     const dirtyArr = bridge.getDirtyView();
 
     for (let r = 0; r < this.rows; r++) {
@@ -659,11 +657,9 @@ export class Renderer {
     this.prevCursorRow = cursor.row;
     this.prevCursorCol = cursor.col;
 
-    // Update the container background only when the last row was actually
-    // repainted, avoiding stale reads during partial mid-redraw frames.
     const lastRowDirty = resized || dirtyArr[this.rows - 1] !== 0;
     if (lastRowDirty) {
-      bridge.getCellInto(this.rows - 1, this.cols - 1, this._cellBuf);
+      bridge.getCellInto(this.rows - 1, 0, this._cellBuf);
       const c = this._cellBuf;
       let gridBg = c.bg;
       if (c.flags & FLAG_REVERSE) {

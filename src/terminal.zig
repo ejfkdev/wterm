@@ -949,10 +949,13 @@ fn isWide(cp: u21) bool {
         0xFE10...0xFE6B => true, // CJK Forms / Small Variants
         0xFF01...0xFF60 => true, // Fullwidth Forms
         0xFFE0...0xFFE6 => true, // Fullwidth Signs
+        0x1F000...0x1F0FF => true, // Mahjong / Playing Cards
+        0x1F100...0x1F1FF => true, // Enclosed Alphanumeric Supplement
         0x1F200...0x1F251 => true,
         0x1F300...0x1F64F => true, // Misc Symbols / Emoji
         0x1F680...0x1F6FF => true,
         0x1F900...0x1F9FF => true,
+        0x1FA00...0x1FAFF => true, // Symbols Extended
         0x20000...0x3FFFD => true, // CJK Extension B+
         else => false,
     };
